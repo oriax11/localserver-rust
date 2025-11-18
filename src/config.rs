@@ -31,3 +31,4 @@ pub fn load_config(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
     let config: Config = serde_yaml::from_str(&file_content)?;
     Ok(config)
 }
+
