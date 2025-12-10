@@ -1,13 +1,46 @@
 use crate::config::Config;
 use crate::request::HttpRequestBuilder;
+use crate::router::Router;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::fs;
+use std::io::{self, Read, Write};
 use std::time::Instant;
-use crate::router::*;
+use std::net::Shutdown;
 
 const SERVER_TOKEN: Token = Token(0);
+
+pub trait HttpResponseCommon {
+    fn peek(&self) -> &[u8];
+    fn next(&mut self, n: usize);
+    fn is_finished(&self) -> bool;
+}
+
+pub struct SimpleResponse {
+    data: Vec<u8>,
+    index: usize,
+}
+
+impl SimpleResponse {
+    pub fn new(data: Vec<u8>) -> Self {
+        Self { data, index: 0 }
+    }
+}
+
+impl HttpResponseCommon for SimpleResponse {
+    fn peek(&self) -> &[u8] {
+        &self.data[self.index..]
+    }
+
+    fn next(&mut self, n: usize) {
+        self.index += n;
+    }
+
+    fn is_finished(&self) -> bool {
+        self.index >= self.data.len()
+    }
+}
 
 #[derive(PartialEq, Debug)]
 enum Status {
@@ -15,21 +48,17 @@ enum Status {
     Write,
     Finish,
 }
-#[derive(Debug)]
+
 struct SocketStatus {
     ttl: Instant,
     status: Status,
-    // response: Box<dyn HttpResponseCommon>,
     request: HttpRequestBuilder,
-    index_writed: usize,
+    response: Option<Box<dyn HttpResponseCommon>>,
 }
 
-
-
-#[derive(Debug)]
 struct SocketData {
     stream: TcpStream,
-    status: Option<SocketStatus>,
+    status: SocketStatus,
 }
 
 pub struct Server {
@@ -54,17 +83,16 @@ impl Server {
     }
 
     pub fn run(&mut self, config: Config) -> io::Result<()> {
-        // For now, let's use the first server config and first port
         let server_config = &config.servers[0];
         let addr = format!("{}:{}", server_config.host, server_config.ports[0])
             .parse()
             .unwrap();
 
-        let mut main_listener = TcpListener::bind(addr)?;
+        let mut listener = TcpListener::bind(addr)?;
         self.poll
             .registry()
-            .register(&mut main_listener, SERVER_TOKEN, Interest::READABLE)?;
-        self.listeners.insert(SERVER_TOKEN, main_listener);
+            .register(&mut listener, SERVER_TOKEN, Interest::READABLE)?;
+        self.listeners.insert(SERVER_TOKEN, listener);
 
         println!("Server listening on {}", addr);
 
@@ -74,50 +102,51 @@ impl Server {
             for event in self.events.iter() {
                 match event.token() {
                     SERVER_TOKEN => {
-                        // Accept new connections
+                        // Accept all incoming connections
+                        let listener = self.listeners.get_mut(&SERVER_TOKEN).unwrap();
                         loop {
-                            match self.listeners.get_mut(&SERVER_TOKEN).unwrap().accept() {
+                            match listener.accept() {
                                 Ok((mut stream, _)) => {
                                     let token = Token(self.next_token);
                                     self.next_token += 1;
 
-                                    self.poll.registry().register(
-                                        &mut stream,
+                                    self.poll
+                                        .registry()
+                                        .register(
+                                            &mut stream,
+                                            token,
+                                            Interest::READABLE.add(Interest::WRITABLE),
+                                        )
+                                        .unwrap();
+
+                                    self.connections.insert(
                                         token,
-                                        Interest::READABLE,
-                                    )?;
+                                        SocketData {
+                                            stream,
+                                            status: SocketStatus {
+                                                ttl: Instant::now(),
+                                                status: Status::Read,
+                                                request: HttpRequestBuilder::new(),
+                                                response: None,
+                                            },
+                                        },
+                                    );
 
-                                    let socket_status = SocketStatus {
-                                        ttl: Instant::now(),
-                                        status: Status::Read,
-                                        request: HttpRequestBuilder::new(),
-                                        index_writed: 0,
-                                    };
-                                    let socket_data = SocketData {
-                                        stream,
-                                        status: Some(socket_status),
-                                    };
-
-                                    self.connections.insert(token, socket_data);
-                                    println!("Accepted new connection with token: {:?}", token);
+                                    println!("Accepted connection {:?}", token);
                                 }
-                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                    // No more connections to accept
-                                    break;
-                                }
+                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                                 Err(e) => {
-                                    eprintln!("Failed to accept connection: {}", e);
+                                    eprintln!("Accept error: {:?}", e);
                                     break;
                                 }
                             }
                         }
                     }
                     token => {
-                        if event.is_readable() {
-                            if let Some(socket_data) = self.connections.get_mut(&token) {
-                                println!("handling");
-
-                                Self::handle(socket_data, &self.router);
+                        if let Some(socket_data) = self.connections.get_mut(&token) {
+                            if Server::handle(socket_data).is_none() {
+                                let _ = socket_data.stream.shutdown(Shutdown::Both);
+                                self.connections.remove(&token);
                             }
                         }
                     }
@@ -126,130 +155,88 @@ impl Server {
         }
     }
 
-    pub fn handle(socket_data: &mut SocketData, router: &Router) -> Option<()> {
-        println!("hadnling");
-        let status = socket_data.status.as_mut()?;
+    pub fn handle(socket_data: &mut SocketData) -> Option<()> {
+        let status_ref = &mut socket_data.status;
 
-        match status.status {
+        match status_ref.status {
             Status::Read => {
-                println!("statusread");
+                let mut buf = [0u8; 2048];
+                loop {
+                    match socket_data.stream.read(&mut buf) {
+                        Ok(0) => return None,
+                        Ok(n) => {
+                            let _ = status_ref.request.append(buf[..n].to_vec());
+                            if status_ref.request.done() {
+                                break;
+                            }
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Some(()),
+                        Err(_) => return None,
+                    }
+                }
 
-                while !status.request.done() {
-                    println!("not done ");
-                    let mut buffer = [0; 2048];
-                    match socket_data.stream.read(&mut buffer) {
-                        Err(e) => match e.kind() {
-                            io::ErrorKind::WouldBlock => return Some(()),
-                            io::ErrorKind::ConnectionReset => return None,
-                            _ => {
-                                eprintln!("Read error: {:?}", e);
-                                return None;
-                            }
-                        },
-                        Ok(m) => {
-                            if m == 0 {
-                                return None;
-                            }
-                            status.ttl = Instant::now();
-                            let _r: Result<(), &'static str> =
-                                status.request.append(buffer[..m].to_vec());
-                            println!("{:#?} ", status.request);
-                            // if r.is_err() {
-                            //     // Early return response if not valid request is sended
-                            //     let error_msg = r.err().unwrap();
-                            //     let response =
-                            //         HttpResponse::new(HttpStatus::BadRequest, error_msg, None)
-                            //             .to_bytes();
-                            //     let _ = socket_data.stream.write(&response);
-                            //     let _ = socket_data.stream.flush();
-                            //     let _ = socket_data.stream.shutdown(Shutdown::Both);
-                            //     return None;
-                            // }
+                // Préparer la réponse HTTP
+                let request = status_ref.request.get()?;
+                let path = if request.path == "/" {
+                    "public/index.html".to_string()
+                } else {
+                    format!("public{}", request.path)
+                };
+
+                let response_bytes = match fs::read(&path) {
+                    Ok(content) => {
+                        let mut headers = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\n\r\n",
+                            content.len()
+                        )
+                        .into_bytes();
+                        headers.extend_from_slice(&content);
+                        headers
+                    }
+                    Err(_) => b"HTTP/1.1 404 Not Found\r\n\r\n".to_vec(),
+                };
+
+                status_ref.response = Some(Box::new(SimpleResponse::new(response_bytes)));
+                status_ref.status = Status::Write;
+                Some(())
+            }
+
+            Status::Write => {
+                if let Some(response) = &mut status_ref.response {
+                    loop {
+                        let data = response.peek();
+                        if data.is_empty() {
+                            break;
+                        }
+                        match socket_data.stream.write(data) {
+                            Ok(n) => response.next(n),
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Some(()),
+                            Err(_) => return None,
+                        }
+                    }
+
+                    if response.is_finished() {
+                        let request = status_ref.request.get()?;
+                        let keep_alive = request
+                            .headers
+                            .get("connection")
+                            .map(|v| v.to_lowercase() == "keep-alive")
+                            .unwrap_or(false);
+
+                        if keep_alive {
+                            status_ref.status = Status::Read;
+                            status_ref.request = HttpRequestBuilder::new();
+                            status_ref.response = None;
+                        } else {
+                            let _ = socket_data.stream.shutdown(Shutdown::Both);
+                            return None;
                         }
                     }
                 }
-                let request = status.request.get()?;
-                let keep_alive = request
-                    .headers
-                    .get("connection")
-                    .map(|v| v.to_lowercase() == "keep-alive")
-                    .unwrap_or(false);
-
-                if let Some(h) = router.route(&request.path) {
-                    let response_bytes = h.handle(&request);
-
-                    status.status = Status::Write;
-                    status.index_writed = 0;
-                    // status.response_bytes = response_bytes;
-                } else {
-                    // 404
-                    status.status = Status::Write;
-                    // status.response_bytes = b"HTTP/1.1 404 Not F ound\r\n\r\n".to_vec();
-                } // if keep_alive {
-                //     response
-                //         .base()
-                //         .headers
-                //         .entry("connection")
-                //         .or_insert("keep-alive".to_string());
-                //     response.base().headers.insert(
-                //         "Keep-Alive",
-                //         &format!("timeout={}", KEEP_ALIVE_TTL.as_secs()),
-                //     );
-                // } else {
-                //     response.base().headers.insert("Connection", "close");
-                // }
-                status.status = Status::Write;
-                // status.response = response;
-                // status.response.set_stream(&socket_data.stream);
+                Some(())
             }
-            Status::Write => {
-                // loop {
-                //     match status.response.peek() {
-                //         Ok(n) => match socket_data.stream.write(&n) {
-                //             Ok(_) => {
-                //                 status.ttl = Instant::now();
-                //                 let _ = status.response.next();
-                //             }
-                //             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Some(()),
-                //             Err(e) => {
-                //                 eprintln!("Write error: {:?}", e);
-                //                 return None;
-                //             }
-                //         },
-                //         Err(IterError::WouldBlock) => {
-                //             status.ttl = Instant::now();
-                //             return Some(());
-                //         }
-                //         Err(_) => break,
-                //     }
-                // }
-                // status.status = Status::Finish;
-                // let request = status.request.get()?;
-                // let keep_alive = request
-                //     .headers
-                //     .get("connection")
-                //     .map(|v| v.to_lowercase() == "keep-alive")
-                //     .unwrap_or(false);
-                // if keep_alive {
-                //     status.status = Status::Read;
-                //     status.index_writed = 0;
-                //     status.request = HttpRequestBuilder::new();
-                //     return Some(());
-                // } else {
-                //     let _ = socket_data.stream.shutdown(Shutdown::Both);
-                //     return None;
-                // }
-            }
-            Status::Finish => {
-                return None;
-            }
-        };
-        Some(())
 
-        // If the request is not yet complete, read data from the stream into a buffer.
-        // This ensures that the server can handle partial or chunked requests.
-
-        // Seting the stream in case is needed for the response, (example: streaming)
-        // Write the response to the client in chunks
+            Status::Finish => None,
+        }
     }
 }

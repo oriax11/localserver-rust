@@ -1,18 +1,15 @@
-use std::collections::HashMap;
-
 use crate::request::HttpRequest;
-use crate::response::HttpResponse;
 
-type Handler = fn(&HttpRequest) -> HttpResponse;
+type Handler = fn(&HttpRequest) -> Vec<u8>; // renvoie directement les bytes
 
 pub struct Router {
-    routes: HashMap<String, Handler>,
+    routes: std::collections::HashMap<String, Handler>,
 }
 
 impl Router {
     pub fn new() -> Self {
         Router {
-            routes: HashMap::new(),
+            routes: std::collections::HashMap::new(),
         }
     }
 
