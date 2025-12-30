@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
-use std::path::Path;
 
 const LISTENER_TOKEN_START: usize = 0;
 const CONNECTION_TOKEN_START: usize = 10000;
@@ -295,15 +295,20 @@ impl Server {
                     .or_else(|| selected_server.and_then(|s| s.root.as_deref()))
                     .unwrap_or("public");
 
-                let path = if request.path == "/" {
-                    format!("{}/{}", doc_root, default_file)
-                } else {
-                    format!("{}{}", doc_root, request.path)
+                let path = match safe_path(doc_root, &request.path, default_file) {
+                    Some(p) => p,
+                    None => {
+                        status_ref.response = Some(Box::new(SimpleResponse::new(
+                            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                        )));
+                        status_ref.status = Status::Write;
+                        return Some(true);
+                    }
                 };
 
                 println!("HOST      = {}", hostname);
                 println!("DOC ROOT  = {}", doc_root);
-                println!("FILE PATH= {}", path);
+                println!("FILE PATH= {:#?}", path);
 
                 let response_bytes = if path.ends_with(".py")
                     && route.as_ref().and_then(|r| r.cgi.as_ref()) == Some(&".py".to_string())
@@ -311,15 +316,16 @@ impl Server {
                     crate::cgi::execute_cgi(request, &doc_root)
                 } else if Path::new(&path).exists() {
                     let content = fs::read(&path).unwrap_or_default();
-                    let mime = match path.rsplit('.').next() {
-                        Some("html") => "text/html",
-                        Some("css") => "text/css",
-                        Some("js") => "application/javascript",
-                        Some("png") => "image/png",
-                        Some("jpg") | Some("jpeg") => "image/jpeg",
-                        Some("gif") => "image/gif",
-                        _ => "application/octet-stream",
+                    let mime = match path.extension().and_then(|ext| ext.to_str()) {
+                        Some(ext) => match ext {
+                            "html" => "text/html",
+                            "css" => "text/css",
+                            "js" => "application/javascript",
+                            _ => "application/octet-stream",
+                        },
+                        None => "application/octet-stream",
                     };
+
                     let headers = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {}\r\n\r\n",
                         content.len(),
@@ -334,7 +340,7 @@ impl Server {
 
                 status_ref.response = Some(Box::new(SimpleResponse::new(response_bytes)));
                 status_ref.status = Status::Write;
-                println!("Serving path: {} for Host : {}", path, hostname);
+                println!("Serving path: {:#?} for Host : {}", path, hostname);
                 Some(true)
             }
 
@@ -381,4 +387,23 @@ impl Server {
             }
         }
     }
+}
+
+fn safe_path(doc_root: &str, req_path: &str, default_file: &str) -> Option<PathBuf> {
+    let mut full_path = Path::new(doc_root).join(req_path.trim_start_matches('/'));
+
+    if full_path.is_dir() {
+        full_path = full_path.join(default_file);
+    }
+
+    // Canonicalize pour résoudre les ../ et symlinks
+    let canonical = full_path.canonicalize().ok()?;
+
+    // Vérifier que le fichier reste dans doc_root
+    let doc_root_canonical = Path::new(doc_root).canonicalize().ok()?;
+    if !canonical.starts_with(doc_root_canonical) {
+        return None; // accès interdit
+    }
+
+    Some(canonical)
 }
