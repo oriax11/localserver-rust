@@ -218,7 +218,7 @@ impl Server {
                                 Some(true) => continue, // State changed, keep going
                                 Some(false) => {
                                     println!("Would block, waiting for next event.");
-                                    return break;
+                                    break;
                                 } // Would block, need event
                                 None => {
                                     // Done/error
@@ -254,9 +254,7 @@ impl Server {
                             }
                         }
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            return {
-                                Some(false)
-                            };
+                            return { Some(false) };
                         }
                         Err(_) => return None,
                     }
@@ -269,44 +267,53 @@ impl Server {
                 let hostname = request
                     .headers
                     .get("host")
-                    .and_then(|h| h.split(':').next())
-                    .unwrap_or("");
+                    .map(|h| h.split(':').next().unwrap_or("").to_lowercase())
+                    .unwrap_or_default();
 
-                // Select server based on hostname
                 let selected_server = if let Some(info) = listener_info {
-                    // Try to find a server matching the hostname
-                    let matched = info.servers.iter().find(|s| s.server_name == hostname);
-
-                    if let Some(srv) = matched {
-                        println!(
-                            "Selected server '{}' for Host: {}",
-                            srv.server_name, hostname
-                        );
-                        Some(srv)
-                    } else {
-                        let default = info.servers.get(info.default_server_index);
-                        if let Some(srv) = default {
-                            println!(
-                                "No match for Host: '{}', using default server '{}'",
-                                hostname, srv.server_name
-                            );
-                        }
-                        default
-                    }
+                    info.servers
+                        .iter()
+                        .find(|s| s.server_name.to_lowercase() == hostname)
+                        .or_else(|| info.servers.get(info.default_server_index))
                 } else {
                     None
                 };
 
-                // Use selected server's document root or fallback to "public"
-                let doc_root = selected_server
-                    .and_then(|s| s.root.as_deref())
+                let route = selected_server.and_then(|s| {
+                    s.routes.iter().find(|r| {
+                        request.path == r.path || request.path.starts_with(&(r.path.clone() + "/"))
+                    })
+                });
+
+                let default_file = route
+                    .and_then(|r| r.default_file.as_deref())
+                    .unwrap_or("index.html");
+
+                let doc_root = route
+                    .and_then(|r| r.root.as_deref())
+                    .or_else(|| selected_server.and_then(|s| s.root.as_deref()))
                     .unwrap_or("public");
 
                 let path = if request.path == "/" {
-                    format!("{}/index.html", doc_root)
+                    format!("{}/{}", doc_root, default_file)
                 } else {
                     format!("{}{}", doc_root, request.path)
                 };
+
+                println!("HOST      = {}", hostname);
+                println!("DOC ROOT  = {}", doc_root);
+                println!("FILE PATH= {}", path);
+
+                // // Use selected server's document root or fallback to "public"
+                // let doc_root = selected_server
+                //     .and_then(|s| s.root.as_deref())
+                //     .unwrap_or("public");
+
+                // let path = if request.path == "/" {
+                //     format!("{}/index.html", doc_root)
+                // } else {
+                //     format!("{}{}", doc_root, request.path)
+                // };
 
                 let response_bytes = match fs::read(&path) {
                     Ok(content) => {
@@ -323,7 +330,7 @@ impl Server {
 
                 status_ref.response = Some(Box::new(SimpleResponse::new(response_bytes)));
                 status_ref.status = Status::Write;
-                println!("Serving path: {} for Host gggggggggg: {}", path, hostname);
+                println!("Serving path: {} for Host : {}", path, hostname);
                 Some((true))
             }
 

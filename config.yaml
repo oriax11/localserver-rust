@@ -13,18 +13,18 @@ servers:
     routes:
       - path: "/"
         methods: ["GET", "POST"]
-        root: "/var/www/html"
+        root: "public"
         default_file: "index.html"
-      
+
       - path: "/blog"
         methods: ["GET"]
         root: "/var/www/blog"
         list_directory: true
-      
+
       - path: "/api"
         methods: ["GET", "POST"]
         redirect: "https://api.example.com"
-      
+
       - path: "/cgi-bin"
         methods: ["GET", "POST"]
         root: "/var/www/cgi"
@@ -34,8 +34,10 @@ servers:
     host: 127.0.0.1
     ports:
       - 8080
+    root: "blog"
+
     routes:
       - path: "/"
         methods: ["GET"]
-        root: "/var/www/blog"
+        root: "/var/www/html"
         default_file: "index.html"
