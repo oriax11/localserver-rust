@@ -8,6 +8,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::time::Instant;
+use std::path::Path;
 
 const LISTENER_TOKEN_START: usize = 0;
 const CONNECTION_TOKEN_START: usize = 10000;
@@ -304,21 +305,31 @@ impl Server {
                 println!("DOC ROOT  = {}", doc_root);
                 println!("FILE PATH= {}", path);
 
-                let response_bytes = if let Some(route) = route {
-                    if let Some(cgi_ext) = &route.cgi {
-                        if path.ends_with(cgi_ext) {
-                            // exécuter le script CGI au lieu de lire le fichier
-                            crate::cgi::execute_cgi(request, &doc_root)
-                        } else {
-                            fs::read(&path)
-                                .unwrap_or_else(|_| b"HTTP/1.1 404 Not Found\r\n\r\n".to_vec())
-                        }
-                    } else {
-                        fs::read(&path)
-                            .unwrap_or_else(|_| b"HTTP/1.1 404 Not Found\r\n\r\n".to_vec())
-                    }
+                let response_bytes = if path.ends_with(".py")
+                    && route.as_ref().and_then(|r| r.cgi.as_ref()) == Some(&".py".to_string())
+                {
+                    crate::cgi::execute_cgi(request, &doc_root)
+                } else if Path::new(&path).exists() {
+                    let content = fs::read(&path).unwrap_or_default();
+                    let mime = match path.rsplit('.').next() {
+                        Some("html") => "text/html",
+                        Some("css") => "text/css",
+                        Some("js") => "application/javascript",
+                        Some("png") => "image/png",
+                        Some("jpg") | Some("jpeg") => "image/jpeg",
+                        Some("gif") => "image/gif",
+                        _ => "application/octet-stream",
+                    };
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {}\r\n\r\n",
+                        content.len(),
+                        mime
+                    );
+                    let mut bytes = headers.into_bytes();
+                    bytes.extend_from_slice(&content);
+                    bytes
                 } else {
-                    b"HTTP/1.1 404 Not Found\r\n\r\n".to_vec()
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec()
                 };
 
                 status_ref.response = Some(Box::new(SimpleResponse::new(response_bytes)));
@@ -328,40 +339,38 @@ impl Server {
             }
 
             Status::Write => {
-                println!("Writing response to client...");
                 if let Some(response) = &mut status_ref.response {
                     loop {
                         let data = response.peek();
                         if data.is_empty() {
-                            break;
+                            break; // tout envoyé
                         }
                         match socket_data.stream.write(data) {
                             Ok(n) => response.next(n),
                             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                return Some(false); // attend le prochain événement
+                                return Some(false); // attendre prochain événement
                             }
-                            Err(_) => return None, // erreur fatale, fermer
+                            Err(_) => return None, // erreur -> fermer connexion
                         }
                     }
 
-                    if response.is_finished() {
-                        let request = status_ref.request.get().unwrap(); // la requête existe forcément
-                        let keep_alive = request
-                            .headers
-                            .get("connection")
-                            .map(|v| v.to_lowercase() == "keep-alive")
-                            .unwrap_or(false);
-                        if keep_alive {
-                            // On garde la connexion ouverte pour la prochaine requête
-                            status_ref.status = Status::Read;
-                            status_ref.request = HttpRequestBuilder::new();
-                            status_ref.response = None;
-                        } else {
-                            
-                            // On ferme la connexion
-                            let _ = socket_data.stream.shutdown(Shutdown::Both);
-                            return None;
-                        }
+                    // Ici, tout est écrit
+                    let keep_alive = status_ref
+                        .request
+                        .get()
+                        .and_then(|req| req.headers.get("connection"))
+                        .map(|v| v.to_lowercase() == "keep-alive")
+                        .unwrap_or(false);
+
+                    if keep_alive {
+                        // Réinitialiser pour lire une nouvelle requête sur la même connexion
+                        status_ref.status = Status::Read;
+                        status_ref.request = HttpRequestBuilder::new();
+                        status_ref.response = None;
+                    } else {
+                        // Fermer la connexion
+                        let _ = socket_data.stream.shutdown(Shutdown::Both);
+                        return None;
                     }
                 }
                 Some(true)
