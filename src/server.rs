@@ -238,7 +238,7 @@ impl Server {
     pub fn handle(
         socket_data: &mut SocketData,
         listener_info: Option<&ListenerInfo>,
-    ) -> Option<(bool)> {
+    ) -> Option<bool> {
         let status_ref = &mut socket_data.status;
 
         match status_ref.status {
@@ -254,7 +254,7 @@ impl Server {
                             }
                         }
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            return { Some(false) };
+                            return Some(false);
                         }
                         Err(_) => return None,
                     }
@@ -304,40 +304,32 @@ impl Server {
                 println!("DOC ROOT  = {}", doc_root);
                 println!("FILE PATH= {}", path);
 
-                // // Use selected server's document root or fallback to "public"
-                // let doc_root = selected_server
-                //     .and_then(|s| s.root.as_deref())
-                //     .unwrap_or("public");
-
-                // let path = if request.path == "/" {
-                //     format!("{}/index.html", doc_root)
-                // } else {
-                //     format!("{}{}", doc_root, request.path)
-                // };
-
-                let response_bytes = match fs::read(&path) {
-                    Ok(content) => {
-                        let mut headers = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\n\r\n",
-                            content.len()
-                        )
-                        .into_bytes();
-                        headers.extend_from_slice(&content);
-                        headers
+                let response_bytes = if let Some(route) = route {
+                    if let Some(cgi_ext) = &route.cgi {
+                        if path.ends_with(cgi_ext) {
+                            // exécuter le script CGI au lieu de lire le fichier
+                            crate::cgi::execute_cgi(request, &doc_root)
+                        } else {
+                            fs::read(&path)
+                                .unwrap_or_else(|_| b"HTTP/1.1 404 Not Found\r\n\r\n".to_vec())
+                        }
+                    } else {
+                        fs::read(&path)
+                            .unwrap_or_else(|_| b"HTTP/1.1 404 Not Found\r\n\r\n".to_vec())
                     }
-                    Err(_) => b"HTTP/1.1 404 Not Found\r\n\r\n".to_vec(),
+                } else {
+                    b"HTTP/1.1 404 Not Found\r\n\r\n".to_vec()
                 };
 
                 status_ref.response = Some(Box::new(SimpleResponse::new(response_bytes)));
                 status_ref.status = Status::Write;
                 println!("Serving path: {} for Host : {}", path, hostname);
-                Some((true))
+                Some(true)
             }
 
             Status::Write => {
                 println!("Writing response to client...");
                 if let Some(response) = &mut status_ref.response {
-                    println!("Writing response...");
                     loop {
                         let data = response.peek();
                         if data.is_empty() {
@@ -346,33 +338,33 @@ impl Server {
                         match socket_data.stream.write(data) {
                             Ok(n) => response.next(n),
                             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                return Some(false);
+                                return Some(false); // attend le prochain événement
                             }
-                            Err(_) => return None,
+                            Err(_) => return None, // erreur fatale, fermer
                         }
                     }
 
                     if response.is_finished() {
-                        let request = status_ref.request.get()?;
+                        let request = status_ref.request.get().unwrap(); // la requête existe forcément
                         let keep_alive = request
                             .headers
                             .get("connection")
                             .map(|v| v.to_lowercase() == "keep-alive")
                             .unwrap_or(false);
-
                         if keep_alive {
+                            // On garde la connexion ouverte pour la prochaine requête
                             status_ref.status = Status::Read;
                             status_ref.request = HttpRequestBuilder::new();
                             status_ref.response = None;
                         } else {
-                            println!("Closing connection.");
+                            
+                            // On ferme la connexion
                             let _ = socket_data.stream.shutdown(Shutdown::Both);
                             return None;
                         }
                     }
                 }
-                println!("Response written.");
-                Some((true))
+                Some(true)
             }
 
             Status::Finish => {

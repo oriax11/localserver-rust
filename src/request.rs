@@ -6,6 +6,7 @@ pub struct HttpRequest {
     pub path: String,
     pub version: String,
     pub headers: HashMap<String, String>,
+    pub body: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -30,27 +31,64 @@ impl HttpRequestBuilder {
                 if parts.len() != 3 {
                     return Err("Invalid request line");
                 }
+
                 let mut headers = HashMap::new();
-                for line in lines {
+                for line in lines.clone() {
                     let line = line.trim();
                     if line.is_empty() { break; }
                     if let Some((key, val)) = line.split_once(":") {
                         headers.insert(key.to_lowercase(), val.trim().to_string());
                     }
                 }
+
+                // Calculer body si Content-Length présent
+                let content_length = headers
+                    .get("content-length")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+
+                let header_end = self.buffer.windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .unwrap() + 4;
+
+                let body_bytes = if self.buffer.len() >= header_end + content_length {
+                    Some(self.buffer[header_end..header_end + content_length].to_vec())
+                } else if content_length > 0 {
+                    // Body pas encore complet
+                    return Ok(());
+                } else {
+                    None
+                };
+
                 self.request = Some(HttpRequest {
                     method: parts[0].to_string(),
                     path: parts[1].to_string(),
                     version: parts[2].to_string(),
                     headers,
+                    body: body_bytes,
                 });
             }
         }
+
         Ok(())
     }
 
     pub fn done(&self) -> bool {
-        self.buffer.windows(4).any(|w| w == b"\r\n\r\n")
+        // Vérifie si headers complets
+        if self.buffer.windows(4).any(|w| w == b"\r\n\r\n") {
+            if let Some(request) = &self.request {
+                if let Some(cl) = request.headers.get("content-length") {
+                    if let Ok(len) = cl.parse::<usize>() {
+                        let header_end = self.buffer.windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .unwrap() + 4;
+                        return self.buffer.len() >= header_end + len;
+                    }
+                }
+            }
+            return true;
+        }
+        false
     }
 
     pub fn get(&self) -> Option<&HttpRequest> {
