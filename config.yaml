@@ -8,8 +8,8 @@ servers:
     root: "public"
     client_max_body_size: 5000000
     error_pages:
-      404: "/errors/404.html"
-      500: "/errors/500.html"
+      404: "./error_pages/404.html"
+      500: "./error_pages/500.html"
     routes:
       - path: "/"
         methods: ["GET", "POST"]
@@ -37,5 +37,5 @@ servers:
     routes:
       - path: "/"
         methods: ["GET"]
-        root: "/var/www/blog"
+        root: "./var/www/html"
         default_file: "index.html"

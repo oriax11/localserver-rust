@@ -1,4 +1,4 @@
-use crate::config::{Config, ServerConfig};
+use crate::config::{Config, Route, ServerConfig};
 use crate::request::HttpRequestBuilder;
 use crate::router::Router;
 use mio::net::{TcpListener, TcpStream};
@@ -82,6 +82,287 @@ pub struct Server {
     next_token: usize,
 }
 
+//////////////////////////
+fn build_http_response(
+    status_code: u16,
+    status_text: &str,
+    content: Vec<u8>,
+    content_type: &str,
+) -> Vec<u8> {
+    let mut headers = format!(
+        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\n\r\n",
+        status_code,
+        status_text,
+        content.len(),
+        content_type
+    )
+    .into_bytes();
+    headers.extend_from_slice(&content);
+    headers
+}
+
+fn build_404_response(error_page_path: &str) -> Vec<u8> {
+    match fs::read(error_page_path) {
+        Ok(content) => {
+            println!("Serving custom 404 error page from: {}", error_page_path);
+            build_http_response(404, "Not Found", content, "text/html")
+        }
+        Err(e) => {
+            println!(
+                "Error page '{}' not found, sending minimal 404 response. [Error: {:?}]",
+                error_page_path, e
+            );
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec()
+        }
+    }
+}
+
+fn serve_file_or_404(file_path: &str, error_page_path: &str) -> Vec<u8> {
+    println!("Attempting to serve file: {}", file_path);
+
+    match fs::read(file_path) {
+        Ok(content) => {
+            println!("File found, serving 200 OK");
+            build_http_response(200, "OK", content, "text/html")
+        }
+        Err(_) => {
+            println!("File not found: {}, serving 404 page", file_path);
+            build_404_response(error_page_path)
+        }
+    }
+}
+
+/// Extracts the hostname from the Host header (strips port if present)
+fn extract_hostname(headers: &HashMap<String, String>) -> &str {
+    headers
+        .get("host")
+        .and_then(|h| h.split(':').next())
+        .unwrap_or("")
+}
+
+fn select_server<'a>(listener_info: &'a ListenerInfo, hostname: &str) -> Option<&'a ServerConfig> {
+    // Try to find a server matching the hostname
+    let matched = listener_info
+        .servers
+        .iter()
+        .find(|s| s.server_name == hostname);
+
+    if let Some(srv) = matched {
+        println!(
+            "Selected server '{}' for Host: {}",
+            srv.server_name, hostname
+        );
+        Some(srv)
+    } else {
+        let default = listener_info
+            .servers
+            .get(listener_info.default_server_index);
+        if let Some(srv) = default {
+            println!(
+                "No match for Host: '{}', using default server '{}'",
+                hostname, srv.server_name
+            );
+        }
+        default
+    }
+}
+
+fn get_error_page_path(server: Option<&ServerConfig>, status_code: u16) -> String {
+    server
+        .and_then(|s| {
+            s.error_pages
+                .iter()
+                .find(|ep| ep.code == status_code)
+                .map(|ep| ep.path.clone())
+        })
+        .unwrap_or_else(|| format!("./error_pagesfff/{}.html", status_code))
+}
+
+fn find_matching_route<'a>(server: &'a ServerConfig, request_path: &str) -> Option<&'a Route> {
+    server
+        .routes
+        .iter()
+        .filter(|route| {
+            if route.path == "/" {
+                true
+            } else {
+                request_path == route.path || request_path.starts_with(&(route.path.clone() + "/"))
+            }
+        })
+        .max_by_key(|route| route.path.len())
+}
+
+fn resolve_file_path(
+    server: Option<&ServerConfig>,
+    route: &crate::config::Route,
+    request_path: &str,
+) -> String {
+    let server_root = server.and_then(|s| s.root.as_deref()).unwrap_or(".");
+    let route_root = route.root.as_deref().unwrap_or("");
+    let base = format!("{}/{}", server_root, route_root);
+
+    if request_path == route.path {
+        if let Some(index) = &route.default_file {
+            format!("{}/{}", base, index)
+        } else {
+            base
+        }
+    } else {
+        let suffix = request_path.strip_prefix(&route.path).unwrap_or("");
+        format!("{}/{}", base, suffix)
+    }
+}
+//////
+
+/// Returns Some(true) if request is complete, Some(false) if would block, None on error
+fn read_request(stream: &mut TcpStream, request: &mut HttpRequestBuilder) -> Option<bool> {
+    let mut buf = [0u8; 2048];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => return None, // Connection closed
+            Ok(n) => {
+                let _ = request.append(buf[..n].to_vec());
+                if request.done() {
+                    return Some(true); // Request complete
+                }
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                return Some(false); // Would block, need more data
+            }
+            Err(_) => return None, // Error
+        }
+    }
+}
+
+/// Writes response data to the stream
+/// Returns Some(true) if should continue, Some(false) if would block, None on error
+fn write_response(
+    stream: &mut TcpStream,
+    response: &mut Box<dyn HttpResponseCommon>,
+) -> Option<bool> {
+    loop {
+        let data = response.peek();
+        if data.is_empty() {
+            return Some(true); // Write complete
+        }
+        match stream.write(data) {
+            Ok(n) => response.next(n),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                return Some(false); // Would block
+            }
+            Err(_) => return None, // Error
+        }
+    }
+}
+
+/// Checks if the connection should be kept alive based on headers
+fn should_keep_alive(request: &crate::request::HttpRequest) -> bool {
+    request
+        .headers
+        .get("connection")
+        .map(|v| v.to_lowercase() == "keep-alive")
+        .unwrap_or(false)
+}
+
+//////////////////////////
+///
+///
+///
+///
+fn handle_read_state(
+    socket_data: &mut SocketData,
+    listener_info: Option<&ListenerInfo>,
+) -> Option<bool> {
+    // Read the request
+    let read_result = read_request(&mut socket_data.stream, &mut socket_data.status.request);
+
+    match read_result {
+        Some(true) => {}       // Request complete, continue processing
+        other => return other, // Would block or error
+    }
+
+    // Parse request
+    let request = socket_data.status.request.get()?;
+
+    // Select server based on Host header
+    let hostname = extract_hostname(&request.headers);
+    let selected_server = listener_info.and_then(|info| select_server(info, hostname));
+
+
+    // Get error page path
+    let error_page_path = get_error_page_path(selected_server, 404);
+
+
+    println!("Processing request: {} {}", request.method, request.path);
+    // Find matching route
+    let selected_route =
+        selected_server.and_then(|server| find_matching_route(server, &request.path))?;
+
+    // Resolve file path
+    let file_path = resolve_file_path(selected_server, selected_route, &request.path);
+
+    println!(
+        "Handling request for path: {} using file: {}",
+        request.path, file_path
+    );
+
+    // Generate response
+    let response_bytes = serve_file_or_404(&file_path, &error_page_path);
+
+    println!(
+        "Prepared response for {}: {} bytes",
+        request.path,
+        response_bytes.len()
+    );
+
+    // Update state
+    socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
+    socket_data.status.status = Status::Write;
+
+    Some(true)
+}
+
+/// Handles the Write state: writes response and manages keep-alive
+fn handle_write_state(socket_data: &mut SocketData) -> Option<bool> {
+    println!("Writing response to client...");
+
+    let response = socket_data.status.response.as_mut()?;
+
+    // Write the response
+    let write_result = write_response(&mut socket_data.stream, response);
+
+    match write_result {
+        Some(true) => {}       // Write complete, check if finished
+        other => return other, // Would block or error
+    }
+
+    // Check if response is finished
+    if !response.is_finished() {
+        return Some(true);
+    }
+
+    println!("Response written.");
+
+    // Check for keep-alive
+    let request = socket_data.status.request.get()?;
+    let keep_alive = should_keep_alive(request);
+
+    if keep_alive {
+        // Reset for next request
+        socket_data.status.status = Status::Read;
+        socket_data.status.request = HttpRequestBuilder::new();
+        socket_data.status.response = None;
+        Some(true)
+    } else {
+        // Close connection
+        println!("Closing connection.");
+        let _ = socket_data.stream.shutdown(Shutdown::Both);
+        None
+    }
+}
+
+/// Main handler function
+
 impl Server {
     pub fn new() -> io::Result<Self> {
         Ok(Server {
@@ -108,6 +389,7 @@ impl Server {
             }
         }
 
+        // println!("listener_map: {:#?}", listener_map);
         // Step 2: Create one listener per unique (host, port)
         let mut token_counter = LISTENER_TOKEN_START;
 
@@ -218,7 +500,7 @@ impl Server {
                                 Some(true) => continue, // State changed, keep going
                                 Some(false) => {
                                     println!("Would block, waiting for next event.");
-                                    return break;
+                                    break;
                                 } // Would block, need event
                                 None => {
                                     // Done/error
@@ -238,139 +520,11 @@ impl Server {
     pub fn handle(
         socket_data: &mut SocketData,
         listener_info: Option<&ListenerInfo>,
-    ) -> Option<(bool)> {
-        let status_ref = &mut socket_data.status;
-
-        match status_ref.status {
-            Status::Read => {
-                let mut buf = [0u8; 2048];
-                loop {
-                    match socket_data.stream.read(&mut buf) {
-                        Ok(0) => return None,
-                        Ok(n) => {
-                            let _ = status_ref.request.append(buf[..n].to_vec());
-                            if status_ref.request.done() {
-                                break;
-                            }
-                        }
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            return {
-                                Some(false)
-                            };
-                        }
-                        Err(_) => return None,
-                    }
-                }
-
-                // Parse Host header and select the correct server
-                let request = status_ref.request.get()?;
-
-                // Extract hostname from Host header (strip port if present)
-                let hostname = request
-                    .headers
-                    .get("host")
-                    .and_then(|h| h.split(':').next())
-                    .unwrap_or("");
-
-                // Select server based on hostname
-                let selected_server = if let Some(info) = listener_info {
-                    // Try to find a server matching the hostname
-                    let matched = info.servers.iter().find(|s| s.server_name == hostname);
-
-                    if let Some(srv) = matched {
-                        println!(
-                            "Selected server '{}' for Host: {}",
-                            srv.server_name, hostname
-                        );
-                        Some(srv)
-                    } else {
-                        let default = info.servers.get(info.default_server_index);
-                        if let Some(srv) = default {
-                            println!(
-                                "No match for Host: '{}', using default server '{}'",
-                                hostname, srv.server_name
-                            );
-                        }
-                        default
-                    }
-                } else {
-                    None
-                };
-
-                // Use selected server's document root or fallback to "public"
-                let doc_root = selected_server
-                    .and_then(|s| s.root.as_deref())
-                    .unwrap_or("public");
-
-                let path = if request.path == "/" {
-                    format!("{}/index.html", doc_root)
-                } else {
-                    format!("{}{}", doc_root, request.path)
-                };
-
-                let response_bytes = match fs::read(&path) {
-                    Ok(content) => {
-                        let mut headers = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\n\r\n",
-                            content.len()
-                        )
-                        .into_bytes();
-                        headers.extend_from_slice(&content);
-                        headers
-                    }
-                    Err(_) => b"HTTP/1.1 404 Not Found\r\n\r\n".to_vec(),
-                };
-
-                status_ref.response = Some(Box::new(SimpleResponse::new(response_bytes)));
-                status_ref.status = Status::Write;
-                println!("Serving path: {} for Host gggggggggg: {}", path, hostname);
-                Some((true))
-            }
-
-            Status::Write => {
-                println!("Writing response to client...");
-                if let Some(response) = &mut status_ref.response {
-                    println!("Writing response...");
-                    loop {
-                        let data = response.peek();
-                        if data.is_empty() {
-                            break;
-                        }
-                        match socket_data.stream.write(data) {
-                            Ok(n) => response.next(n),
-                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                                return Some(false);
-                            }
-                            Err(_) => return None,
-                        }
-                    }
-
-                    if response.is_finished() {
-                        let request = status_ref.request.get()?;
-                        let keep_alive = request
-                            .headers
-                            .get("connection")
-                            .map(|v| v.to_lowercase() == "keep-alive")
-                            .unwrap_or(false);
-
-                        if keep_alive {
-                            status_ref.status = Status::Read;
-                            status_ref.request = HttpRequestBuilder::new();
-                            status_ref.response = None;
-                        } else {
-                            println!("Closing connection.");
-                            let _ = socket_data.stream.shutdown(Shutdown::Both);
-                            return None;
-                        }
-                    }
-                }
-                println!("Response written.");
-                Some((true))
-            }
-
-            Status::Finish => {
-                return None;
-            }
+    ) -> Option<bool> {
+        match socket_data.status.status {
+            Status::Read => handle_read_state(socket_data, listener_info),
+            Status::Write => handle_write_state(socket_data),
+            Status::Finish => None,
         }
     }
 }
