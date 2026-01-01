@@ -1,10 +1,14 @@
 use crate::config::{Config, Route, ServerConfig};
 use crate::request::HttpRequestBuilder;
+use crate::response::{
+    HttpResponseBuilder, handle_delete, handle_get, handle_method_not_allowed, handle_post,
+};
 use crate::router::Router;
-use crate::utils::HttpHeaders;
+use crate::utils::{HttpHeaders, HttpMethod};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use std::collections::HashMap;
+use std::f32::consts::E;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
@@ -222,7 +226,10 @@ fn read_request(stream: &mut TcpStream, request: &mut HttpRequestBuilder) -> Opt
         match stream.read(&mut buf) {
             Ok(0) => return None, // Connection closed
             Ok(n) => {
-                let _ = request.append(buf[..n].to_vec());
+
+                if let Err(e) = request.append(buf[..n].to_vec()) {
+                    return None;
+                }
                 if request.done() {
                     return Some(true); // Request complete
                 }
@@ -289,31 +296,57 @@ fn handle_read_state(
     let hostname = extract_hostname(&request.headers);
     let selected_server = listener_info.and_then(|info| select_server(info, hostname));
 
+    // Get error page paths
+    let error_404_path = get_error_page_path(selected_server, 404);
+    let error_405_path = get_error_page_path(selected_server, 405);
+
     // Find matching route
     let selected_route =
         selected_server.and_then(|server| find_matching_route(server, &request.path));
 
-    // Check if method is allowed for this route
-    if let Some(route) = selected_route {
-        let method_allowed = route
-            .methods
-            .iter()
-            .any(|m| m.eq_ignore_ascii_case(&request.method.to_str()));
+    let response_bytes = match selected_route {
+        Some(route) => {
+            // Check if method is allowed
+            let request_method = &request.method;
+            let method_allowed = route
+                .methods
+                .iter()
+                .any(|m| HttpMethod::from_str(m) == *request_method);
 
-        if !method_allowed {
-            // Method not allowed, serve 405
-            // build response and leave it to be written in handle write state
+            if !method_allowed {
+                let allowed: Vec<String> = route.methods.clone();
+
+                handle_method_not_allowed(&allowed, &error_405_path)
+            } else {
+                // Resolve file path
+                let file_path = resolve_file_path(selected_server, route, &request.path);
+
+                // Handle based on method
+                match request_method {
+                    HttpMethod::GET => handle_get(&file_path, &error_404_path),
+                    HttpMethod::POST => {
+                        let body = request.body.as_deref().unwrap_or(&[]);
+                        handle_post(&file_path, body, &error_404_path)
+                    }
+                    HttpMethod::DELETE => handle_delete(&file_path, &error_404_path),
+                    HttpMethod::Other(_) => handle_method_not_allowed(&[], &error_405_path),
+                }
+            }
         }
+        None => {
+            HttpResponseBuilder::serve_error_page(&error_404_path, 404, "Not Found")
+        }
+    };
 
-        // match (request.method)
-    }
+    // Set response and transition to Write state
+    socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
+    socket_data.status.status = Status::Write;
 
     Some(true)
 }
 
 /// Handles the Write state: writes response and manages keep-alive
 fn handle_write_state(socket_data: &mut SocketData) -> Option<bool> {
-    println!("Writing response to client...");
 
     let response = socket_data.status.response.as_mut()?;
 
@@ -330,7 +363,6 @@ fn handle_write_state(socket_data: &mut SocketData) -> Option<bool> {
         return Some(true);
     }
 
-    println!("Response written.");
 
     // Check for keep-alive
     let request = socket_data.status.request.get()?;
@@ -488,7 +520,6 @@ impl Server {
                             match Server::handle(socket_data, listener_info) {
                                 Some(true) => continue, // State changed, keep going
                                 Some(false) => {
-                                    println!("Would block, waiting for next event.");
                                     break;
                                 } // Would block, need event
                                 None => {

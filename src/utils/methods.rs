@@ -8,8 +8,7 @@ pub enum HttpMethod {
 
 impl HttpMethod {
     pub fn from_str(method: &str) -> HttpMethod {
-        let method = method.to_uppercase();
-        match method.as_str() {
+        match method {
             "GET" => HttpMethod::GET,
             "POST" => HttpMethod::POST,
             "DELETE" => HttpMethod::DELETE,
