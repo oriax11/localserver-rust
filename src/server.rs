@@ -204,8 +204,8 @@ fn resolve_file_path(
     route: &crate::config::Route,
     request_path: &str,
 ) -> String {
-    let server_root = server.root.clone();
-    let route_root = route.root.clone();
+    let server_root = &server.root;
+    let route_root = &route.root;
     let base = format!("{}/{}", server_root, route_root);
 
     if request_path == route.path {
@@ -311,7 +311,7 @@ fn handle_read_state(
                 .any(|m| HttpMethod::from_str(m) == *request_method);
 
             if !method_allowed {
-                let allowed: Vec<String> = route.methods.clone();
+                let allowed  = &route.methods;
 
                 handle_method_not_allowed(&allowed, &selected_server)
             } else {
@@ -320,17 +320,21 @@ fn handle_read_state(
 
                 // Handle based on method
                 match request_method {
-                    HttpMethod::GET => handle_get(&file_path, &selected_server),
+                    HttpMethod::GET => handle_get(&file_path, &selected_server , route),
                     HttpMethod::POST => {
                         let body = request.body.as_deref().unwrap_or(&[]);
-                        handle_post(&file_path, body, &error_404_path)
+                        handle_post(&file_path, body)
                     }
-                    HttpMethod::DELETE => handle_delete(&file_path, &error_404_path),
-                    HttpMethod::Other(_) => handle_method_not_allowed(&[], &error_405_path),
+                    HttpMethod::DELETE => {
+                        handle_delete(&file_path, &get_error_page_path(selected_server, 404))
+                    }
+                    HttpMethod::Other(_) => {
+                        let allowed = &route.methods;
+                        handle_method_not_allowed(&allowed, &selected_server)},
                 }
             }
         }
-        None => HttpResponseBuilder::serve_error_page(&error_404_path, 404, "Not Found"),
+        None => HttpResponseBuilder::serve_error_page(&get_error_page_path(selected_server, 404), 404, "Not Found"),
     };
 
     // Set response and transition to Write state

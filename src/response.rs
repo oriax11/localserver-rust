@@ -1,6 +1,6 @@
 use std::fs;
 
-use crate::{config::ServerConfig, server, utils::HttpHeaders};
+use crate::{config::{Route, ServerConfig}, server, utils::HttpHeaders};
 
 pub struct HttpResponseBuilder {
     status_code: u16,
@@ -169,16 +169,18 @@ fn detect_content_type(path: &str) -> &'static str {
 
 // === Handler functions for different HTTP methods ===
 
-pub fn handle_get(request_path: &str, server: &ServerConfig) -> Vec<u8> {
-    if let Some(route) = server.routes.iter().find(|r| r.path == request_path) {
+pub fn handle_get(request_path: &str, server: &ServerConfig, route: &Route) -> Vec<u8> {
+    if let Some(route) = server.routes.iter().find(|r| r.path == route.path) {
         // Directory listing allowed?
         if route.list_directory == Some(true) {
-                return HttpResponseBuilder::serve_directory_listing(&route.root);
+
+            println!("Serving directory  00000000000000000000000000000listing for: {}", route.root);
+            return HttpResponseBuilder::serve_directory_listing(&route.root);
         }
 
         // Default file exists? Serve it
         if let Some(default_file) = &route.default_file {
-            let root = route.root;
+            let root = &route.root;
             let full_path = format!("{}/{}", root, default_file);
             return HttpResponseBuilder::serve_file_or_404(
                 &full_path,
@@ -192,7 +194,7 @@ pub fn handle_get(request_path: &str, server: &ServerConfig) -> Vec<u8> {
     HttpResponseBuilder::serve_file_or_404(request_path, &error_page_path)
 }
 
-pub fn handle_post(file_path: &str, body: &[u8], error_page_path: &str) -> Vec<u8> {
+pub fn handle_post(file_path: &str, body: &[u8]) -> Vec<u8> {
     // Example: Write/append to file
     match fs::write(file_path, body) {
         Ok(_) => {
