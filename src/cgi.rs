@@ -4,8 +4,8 @@ use crate::{
     response::HttpResponseBuilder,
     server::{SimpleResponse, SocketData, Status},
 };
-use std::{process::{Command, Stdio}, ptr::NonNull};
 use std::io::Write;
+use std::process::{Command, Stdio};
 
 /// Structure pour les données CGI (sans référence à socket_data)
 pub struct CgiContext {
@@ -19,11 +19,7 @@ pub struct CgiContext {
 impl CgiContext {
     /// Extrait les données nécessaires de la request
     pub fn from_request(request: &HttpRequest) -> Self {
-        let (path_only, query_string) = match request.path.split_once('?') {
-            Some((p, q)) => (p.to_string(), q.to_string()),
-            None => (request.path.clone(), String::new()),
-        };
-
+        // Use the parsed path and query_string directly from the request
         let headers: Vec<(String, String)> = request
             .headers
             .iter()
@@ -32,8 +28,8 @@ impl CgiContext {
 
         Self {
             method: request.method.to_str().to_string(),
-            path: path_only,
-            query_string,
+            path: request.path.clone(),
+            query_string: request.query_string.clone(),
             headers,
             body: request.body.clone().unwrap_or(Vec::new()),
         }
@@ -59,7 +55,10 @@ pub fn run_cgi(
         }
     };
 
-    println!("Executing CGI: {} {} with query: {}", interpreter, script_path, context.query_string);
+    println!(
+        "Executing CGI: {} {} with query: {}",
+        interpreter, script_path, context.query_string
+    );
 
     // Construire la commande
     let mut cmd = Command::new(interpreter);
@@ -83,9 +82,13 @@ pub fn run_cgi(
     if context.method == "POST" && !context.body.is_empty() {
         cmd.stdin(Stdio::piped());
         cmd.env("CONTENT_LENGTH", context.body.len().to_string());
-        
+
         // Détecter le Content-Type
-        if let Some((_, content_type)) = context.headers.iter().find(|(k, _)| k.to_lowercase() == "content-type") {
+        if let Some((_, content_type)) = context
+            .headers
+            .iter()
+            .find(|(k, _)| k.to_lowercase() == "content-type")
+        {
             cmd.env("CONTENT_TYPE", content_type);
         }
     }
@@ -111,7 +114,7 @@ pub fn run_cgi(
                 Ok(output) => {
                     if output.status.success() {
                         println!("CGI execution successful");
-                        
+
                         // Construire la réponse HTTP
                         let response = HttpResponseBuilder::new(200, "OK")
                             .header("Content-Type", "text/html")
@@ -124,7 +127,7 @@ pub fn run_cgi(
                     } else {
                         eprintln!("CGI script failed with status: {:?}", output.status);
                         eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
-                        
+
                         send_error_response(socket_data, 500, "CGI script execution failed");
                         true // On retourne true car on a géré l'erreur
                     }
@@ -146,8 +149,11 @@ pub fn run_cgi(
 
 /// Helper pour envoyer une réponse d'erreur
 fn send_error_response(socket_data: &mut SocketData, status_code: u16, message: &str) {
-    let error_body = format!("<html><body><h1>{} Error</h1><p>{}</p></body></html>", status_code, message);
-    
+    let error_body = format!(
+        "<html><body><h1>{} Error</h1><p>{}</p></body></html>",
+        status_code, message
+    );
+
     let response = HttpResponseBuilder::new(status_code, message)
         .header("Content-Type", "text/html")
         .body(error_body.into_bytes())

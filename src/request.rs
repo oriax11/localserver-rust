@@ -4,6 +4,7 @@ use crate::utils::{HttpHeaders, HttpMethod};
 pub struct HttpRequest {
     pub method: HttpMethod,
     pub path: String,
+    pub query_string: String,
     pub version: String,
     pub headers: HttpHeaders,
     pub body: Option<Vec<u8>>,
@@ -66,14 +67,24 @@ impl HttpRequestBuilder {
 
     fn find_headers_end(&self) -> Option<usize> {
         if let Some(pos) = self.buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-            return Some(pos+4);
+            return Some(pos + 4);
         }
 
         if let Some(pos) = self.buffer.windows(2).position(|w| w == b"\n\n") {
-            return Some(pos+2);
+            return Some(pos + 2);
         }
 
         None
+    }
+
+    fn parse_path_and_query(full_path: &str) -> (String, String) {
+        if let Some(query_start) = full_path.find('?') {
+            let path = full_path[..query_start].to_string();
+            let query = full_path[query_start + 1..].to_string();
+            (path, query)
+        } else {
+            (full_path.to_string(), String::new())
+        }
     }
 
     fn parse_headers(&mut self, headers_end: usize) -> Result<(), &'static str> {
@@ -97,16 +108,21 @@ impl HttpRequestBuilder {
                 headers.insert(key, val);
             }
         }
-        // CHECK FOR CONNECTION  IF NULL ADD KEEP ALIVE BY DEFAULT
+        
+        // CHECK FOR CONNECTION IF NULL ADD KEEP ALIVE BY DEFAULT
         if !headers.get("connection").is_some() {
             headers.insert("connection", "keep-alive");
         }
 
         let body_type = self.determine_body_type(&headers);
+        
+        // Parse path and query string
+        let (path, query_string) = Self::parse_path_and_query(parts[1]);
 
         self.request = Some(HttpRequest {
             method: HttpMethod::from_str(parts[0]),
-            path: parts[1].to_string(),
+            path,
+            query_string,
             version: parts[2].to_string(),
             headers,
             body: None,
@@ -232,5 +248,65 @@ impl HttpRequestBuilder {
         } else {
             None
         }
+    }
+}
+
+impl HttpRequest {
+    /// Parse the query string into a vector of key-value pairs
+    pub fn parse_query(&self) -> Vec<(String, String)> {
+        if self.query_string.is_empty() {
+            return Vec::new();
+        }
+
+        self.query_string
+            .split('&')
+            .filter_map(|pair| {
+                let mut parts = pair.splitn(2, '=');
+                let key = parts.next()?.to_string();
+                let value = parts.next().unwrap_or("").to_string();
+                
+                // URL decode the key and value
+                let key = Self::url_decode(&key);
+                let value = Self::url_decode(&value);
+                
+                Some((key, value))
+            })
+            .collect()
+    }
+
+    /// Get a specific query parameter value
+    pub fn query_param(&self, key: &str) -> Option<String> {
+        self.parse_query()
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+
+    /// URL decode a string (handles %XX encoding)
+    fn url_decode(s: &str) -> String {
+        let mut result = String::new();
+        let mut chars = s.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '%' {
+                // Try to parse the next two characters as hex
+                let hex: String = chars.by_ref().take(2).collect();
+                if hex.len() == 2 {
+                    if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                        result.push(byte as char);
+                        continue;
+                    }
+                }
+                // If parsing failed, just add the % and continue
+                result.push('%');
+                result.push_str(&hex);
+            } else if ch == '+' {
+                result.push(' ');
+            } else {
+                result.push(ch);
+            }
+        }
+
+        result
     }
 }

@@ -30,6 +30,7 @@ servers:
       - path: "/cgi-bin"
         methods: ["GET", "POST"]
         root: "/var/www/cgi"
+        list_directory: true
         cgi: ".py"
 
   - server_name: "blog.example.com"
