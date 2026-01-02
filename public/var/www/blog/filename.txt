@@ -1,8 +1,0 @@
-
-
---------------------------708617bf069db10b
-Content-Disposition: form-data; name="file"; filename="xyz.txt"
-Content-Type: text/plain
-
-
---------------------------708617bf069db10b

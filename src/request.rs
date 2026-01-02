@@ -66,11 +66,11 @@ impl HttpRequestBuilder {
 
     fn find_headers_end(&self) -> Option<usize> {
         if let Some(pos) = self.buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-            return Some(pos);
+            return Some(pos+4);
         }
 
         if let Some(pos) = self.buffer.windows(2).position(|w| w == b"\n\n") {
-            return Some(pos);
+            return Some(pos+2);
         }
 
         None

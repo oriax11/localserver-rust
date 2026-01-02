@@ -1,6 +1,6 @@
 use crate::config::{Config, Route, ServerConfig};
-use crate::request::HttpRequestBuilder;
 use crate::request::HttpRequest;
+use crate::request::HttpRequestBuilder;
 use crate::response::{
     HttpResponseBuilder, handle_delete, handle_get, handle_method_not_allowed, handle_post,
 };
@@ -292,7 +292,9 @@ fn handle_read_state(
     }
 
     // Parse request
-    let request :&HttpRequest  = socket_data.status.request.get()?;
+    let request: &HttpRequest = socket_data.status.request.get()?;
+
+    println!("Received request: {:#?}", request);
 
     // Select server based on Host header
     let hostname = extract_hostname(&request.headers);
@@ -322,9 +324,7 @@ fn handle_read_state(
                 // Handle based on method
                 match request_method {
                     HttpMethod::GET => handle_get(&file_path, &selected_server, &request),
-                    HttpMethod::POST => {
-                        handle_post(&file_path, &request)
-                    }
+                    HttpMethod::POST => handle_post(&file_path, &request),
                     HttpMethod::DELETE => {
                         handle_delete(&file_path, &get_error_page_path(selected_server, 404))
                     }

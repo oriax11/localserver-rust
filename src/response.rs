@@ -1,4 +1,5 @@
 use std::fs;
+use uuid::Uuid;
 
 use crate::request::HttpRequest;
 use crate::{
@@ -268,6 +269,11 @@ pub fn handle_post(file_path: &str, request: &HttpRequest) -> Vec<u8> {
         }
     };
 
+    if let Ok(s) = std::str::from_utf8(body) {
+        println!("body as string: {}", s);
+    } else {
+        println!("body is binary, cannot print as string");
+    }
     let content_type = match request.headers.get("content-type") {
         Some(v) => v,
         None => {
@@ -277,8 +283,36 @@ pub fn handle_post(file_path: &str, request: &HttpRequest) -> Vec<u8> {
         }
     };
 
-    if content_type.starts_with("application/octet-stream") {
-        return write_file(file_path, body);
+    if content_type.starts_with("application/")
+        || content_type.starts_with("image/")
+        || content_type.starts_with("audio/")
+        || content_type.starts_with("video/")
+        || content_type.starts_with("font/") || content_type .starts_with("text/")
+    {
+        // get file extension from content type
+        let b = content_type.split('/').nth(1).unwrap_or("dat");
+        // For direct uploads, extract filename from the request path
+
+        let filename: String = {
+            let last_segment = request.path.split('/').last().unwrap_or("");
+
+            if last_segment.contains('.') && !last_segment.is_empty() {
+                last_segment.to_string()
+            } else {
+                format!("upload_{}.{}", Uuid::new_v4(), b)
+            }
+        };
+
+        println!("Direct upload filename: {}  and  save path is  {}", filename, file_path);
+
+        let save_path = if file_path.ends_with('/') {
+            format!("{}{}", file_path, filename)
+        } else {
+            format!("{}", file_path)
+        };
+
+        println!("Saving non-multipart file to: {}", save_path);
+        return write_file(&save_path, body);
     }
 
     if content_type.starts_with("multipart/form-data") {
@@ -330,6 +364,7 @@ pub fn handle_post(file_path: &str, request: &HttpRequest) -> Vec<u8> {
             )
             .build()
     } else {
+        println!("Unsupported Content-Type: {}", content_type);
         HttpResponseBuilder::unsupported_media_type()
             .body(b"Unsupported Content-Type".to_vec())
             .build()
@@ -337,6 +372,13 @@ pub fn handle_post(file_path: &str, request: &HttpRequest) -> Vec<u8> {
 }
 
 fn write_file(path: &str, data: &[u8]) -> Vec<u8> {
+    if let Ok(s) = std::str::from_utf8(data) {
+        println!("body as string: {}", s);
+    } else {
+        println!("body is binary, cannot print as string");
+    }
+
+    println!("Writing file to: {}", path);
     match fs::write(path, data) {
         Ok(_) => HttpResponseBuilder::ok()
             .header("Content-Type", "text/plain")
