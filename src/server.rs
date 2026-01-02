@@ -1,18 +1,23 @@
-use crate::config::{Config, Route, ServerConfig};
+use crate::config::{ Config, Route, ServerConfig };
 use crate::request::HttpRequest;
 use crate::request::HttpRequestBuilder;
 use crate::response::{
-    HttpResponseBuilder, handle_delete, handle_get, handle_method_not_allowed, handle_post,
+    HttpResponseBuilder,
+    handle_delete,
+    handle_get,
+    handle_method_not_allowed,
+    handle_post,
 };
 use crate::router::Router;
-use crate::utils::{HttpHeaders, HttpMethod};
-use mio::net::{TcpListener, TcpStream};
-use mio::{Events, Interest, Poll, Token};
+use crate::utils::{ HttpHeaders, HttpMethod };
+use mio::net::{ TcpListener, TcpStream };
+use mio::{ Events, Interest, Poll, Token };
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{ self, Read, Write };
 use std::net::Shutdown;
 use std::time::Instant;
+use crate::cgi::run_cgi;
 
 const LISTENER_TOKEN_START: usize = 0;
 const CONNECTION_TOKEN_START: usize = 10000;
@@ -49,28 +54,28 @@ impl HttpResponseCommon for SimpleResponse {
 }
 
 #[derive(PartialEq, Debug)]
-enum Status {
+pub enum Status {
     Read,
     Write,
     Finish,
 }
 
-struct SocketStatus {
-    ttl: Instant,
-    status: Status,
-    request: HttpRequestBuilder,
-    response: Option<Box<dyn HttpResponseCommon>>,
+pub struct SocketStatus {
+    pub ttl: Instant,
+    pub status: Status,
+    pub request: HttpRequestBuilder,
+    pub response: Option<Box<dyn HttpResponseCommon>>,
 }
 
 // NEW: Track which listener accepted this connection
-struct SocketData {
-    stream: TcpStream,
-    status: SocketStatus,
-    listener_token: Token, // NEW: Remember which listener this came from
+pub struct SocketData {
+    pub stream: TcpStream,
+    pub status: SocketStatus,
+    pub listener_token: Token, // NEW: Remember which listener this came from
 }
 
 // NEW: Information about a listener and its associated servers
-struct ListenerInfo {
+pub struct ListenerInfo {
     listener: TcpListener,
     host: String,
     port: u16,
@@ -92,7 +97,7 @@ fn build_http_response(
     status_code: u16,
     status_text: &str,
     content: Vec<u8>,
-    content_type: &str,
+    content_type: &str
 ) -> Vec<u8> {
     let mut headers = format!(
         "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\n\r\n",
@@ -100,8 +105,7 @@ fn build_http_response(
         status_text,
         content.len(),
         content_type
-    )
-    .into_bytes();
+    ).into_bytes();
     headers.extend_from_slice(&content);
     headers
 }
@@ -115,7 +119,8 @@ fn build_404_response(error_page_path: &str) -> Vec<u8> {
         Err(e) => {
             println!(
                 "Error page '{}' not found, sending minimal 404 response. [Error: {:?}]",
-                error_page_path, e
+                error_page_path,
+                e
             );
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec()
         }
@@ -147,39 +152,34 @@ fn extract_hostname(headers: &HttpHeaders) -> &str {
 
 fn select_server<'a>(listener_info: &'a ListenerInfo, hostname: &str) -> &'a ServerConfig {
     // Try to find a server matching the hostname
-    if let Some(srv) = listener_info
-        .servers
-        .iter()
-        .find(|s| s.server_name == hostname)
-    {
-        println!(
-            "Selected server '{}' for Host: {}",
-            srv.server_name, hostname
-        );
+    if let Some(srv) = listener_info.servers.iter().find(|s| s.server_name == hostname) {
+        println!("Selected server '{}' for Host: {}", srv.server_name, hostname);
         return srv;
     }
 
     // Fallback to default server
     let default_index = listener_info.default_server_index;
-    let default_srv = listener_info.servers.get(default_index).unwrap_or_else(|| {
-        panic!(
-            "Invalid default_server_index {} for listener with {} servers",
-            default_index,
-            listener_info.servers.len()
-        )
-    });
+    let default_srv = listener_info.servers
+        .get(default_index)
+        .unwrap_or_else(|| {
+            panic!(
+                "Invalid default_server_index {} for listener with {} servers",
+                default_index,
+                listener_info.servers.len()
+            )
+        });
 
     println!(
         "No match for Host: '{}', using default server '{}'",
-        hostname, default_srv.server_name
+        hostname,
+        default_srv.server_name
     );
 
     default_srv
 }
 
 fn get_error_page_path(server: &ServerConfig, status_code: u16) -> String {
-    server
-        .error_pages
+    server.error_pages
         .iter()
         .find(|ep| ep.code == status_code)
         .map(|ep| ep.path.clone())
@@ -187,8 +187,7 @@ fn get_error_page_path(server: &ServerConfig, status_code: u16) -> String {
 }
 
 fn find_matching_route<'a>(server: &'a ServerConfig, request_path: &str) -> Option<&'a Route> {
-    server
-        .routes
+    server.routes
         .iter()
         .filter(|route| {
             if route.path == "/" {
@@ -203,18 +202,14 @@ fn find_matching_route<'a>(server: &'a ServerConfig, request_path: &str) -> Opti
 fn resolve_file_path(
     server: &ServerConfig,
     route: &crate::config::Route,
-    request_path: &str,
+    request_path: &str
 ) -> String {
     let server_root = &server.root;
     let route_root = &route.root;
     let base = format!("{}/{}", server_root, route_root);
 
     if request_path == route.path {
-        if let Some(index) = &route.default_file {
-            format!("{}/{}", base, index)
-        } else {
-            base
-        }
+        if let Some(index) = &route.default_file { format!("{}/{}", base, index) } else { base }
     } else {
         let suffix = request_path.strip_prefix(&route.path).unwrap_or("");
         format!("{}/{}", base, suffix)
@@ -227,7 +222,9 @@ fn read_request(stream: &mut TcpStream, request: &mut HttpRequestBuilder) -> Opt
     let mut buf = [0u8; 2048];
     loop {
         match stream.read(&mut buf) {
-            Ok(0) => return None, // Connection closed
+            Ok(0) => {
+                return None;
+            } // Connection closed
             Ok(n) => {
                 if let Err(e) = request.append(buf[..n].to_vec()) {
                     return None;
@@ -239,7 +236,9 @@ fn read_request(stream: &mut TcpStream, request: &mut HttpRequestBuilder) -> Opt
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 return Some(false); // Would block, need more data
             }
-            Err(_) => return None, // Error
+            Err(_) => {
+                return None;
+            } // Error
         }
     }
 }
@@ -248,7 +247,7 @@ fn read_request(stream: &mut TcpStream, request: &mut HttpRequestBuilder) -> Opt
 /// Returns Some(true) if should continue, Some(false) if would block, None on error
 fn write_response(
     stream: &mut TcpStream,
-    response: &mut Box<dyn HttpResponseCommon>,
+    response: &mut Box<dyn HttpResponseCommon>
 ) -> Option<bool> {
     loop {
         let data = response.peek();
@@ -260,15 +259,16 @@ fn write_response(
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 return Some(false); // Would block
             }
-            Err(_) => return None, // Error
+            Err(_) => {
+                return None;
+            } // Error
         }
     }
 }
 
 /// Checks if the connection should be kept alive based on headers
 fn should_keep_alive(request: &crate::request::HttpRequest) -> bool {
-    request
-        .headers
+    request.headers
         .get("connection")
         .map(|v| v.to_lowercase() == "keep-alive")
         .unwrap_or(false)
@@ -281,14 +281,16 @@ fn should_keep_alive(request: &crate::request::HttpRequest) -> bool {
 ///
 fn handle_read_state(
     socket_data: &mut SocketData,
-    listener_info: Option<&ListenerInfo>,
+    listener_info: Option<&ListenerInfo>
 ) -> Option<bool> {
     // Read the request
     let read_result = read_request(&mut socket_data.stream, &mut socket_data.status.request);
 
     match read_result {
-        Some(true) => {}       // Request complete, continue processing
-        other => return other, // Would block or error
+        Some(true) => {} // Request complete, continue processing
+        other => {
+            return other;
+        } // Would block or error
     }
 
     // Parse request
@@ -308,8 +310,7 @@ fn handle_read_state(
         Some(route) => {
             // Check if method is allowed
             let request_method = &request.method;
-            let method_allowed = route
-                .methods
+            let method_allowed = route.methods
                 .iter()
                 .any(|m| HttpMethod::from_str(m) == *request_method);
 
@@ -318,9 +319,21 @@ fn handle_read_state(
 
                 handle_method_not_allowed(&allowed, &selected_server)
             } else {
-                // Resolve file path
                 let file_path = resolve_file_path(selected_server, route, &request.path);
+                //CGI CHECK
+                if let Some(cgi_ext) = &route.cgi {
+                    if request.path.ends_with(cgi_ext) {
+                        println!("CGI detected for path: {}", request.path);
 
+                        let cgi_context = crate::cgi::CgiContext::from_request(request);
+
+                        if run_cgi(route, cgi_context, &file_path, socket_data) {
+                            return Some(true);
+                        } else {
+                            return None; 
+                        }
+                    }
+                }
                 // Handle based on method
                 match request_method {
                     HttpMethod::GET => handle_get(&file_path, &selected_server, &request),
@@ -335,11 +348,12 @@ fn handle_read_state(
                 }
             }
         }
-        None => HttpResponseBuilder::serve_error_page(
-            &get_error_page_path(selected_server, 404),
-            404,
-            "Not Found",
-        ),
+        None =>
+            HttpResponseBuilder::serve_error_page(
+                &get_error_page_path(selected_server, 404),
+                404,
+                "Not Found"
+            ),
     };
 
     // Set response and transition to Write state
@@ -357,8 +371,10 @@ fn handle_write_state(socket_data: &mut SocketData) -> Option<bool> {
     let write_result = write_response(&mut socket_data.stream, response);
 
     match write_result {
-        Some(true) => {}       // Write complete, check if finished
-        other => return other, // Would block or error
+        Some(true) => {} // Write complete, check if finished
+        other => {
+            return other;
+        } // Would block or error
     }
 
     // Check if response is finished
@@ -405,10 +421,7 @@ impl Server {
         for (idx, server) in config.servers.iter().enumerate() {
             for &port in &server.ports {
                 let key = (server.host.clone(), port);
-                listener_map
-                    .entry(key)
-                    .or_insert_with(Vec::new)
-                    .push((idx, server.clone()));
+                listener_map.entry(key).or_insert_with(Vec::new).push((idx, server.clone()));
             }
         }
 
@@ -423,9 +436,7 @@ impl Server {
             let token = Token(token_counter);
             token_counter += 1;
 
-            self.poll
-                .registry()
-                .register(&mut listener, token, Interest::READABLE)?;
+            self.poll.registry().register(&mut listener, token, Interest::READABLE)?;
 
             // Determine default server: first one marked as default, or first in list
             let default_idx = server_list
@@ -433,32 +444,27 @@ impl Server {
                 .position(|(_, srv)| srv.default_server)
                 .unwrap_or(0);
 
-            let servers: Vec<ServerConfig> = server_list.into_iter().map(|(_, srv)| srv).collect();
+            let servers: Vec<ServerConfig> = server_list
+                .into_iter()
+                .map(|(_, srv)| srv)
+                .collect();
 
-            println!(
-                "Listening on {}:{} with {} server(s)",
-                host,
-                port,
-                servers.len()
-            );
+            println!("Listening on {}:{} with {} server(s)", host, port, servers.len());
             for (i, srv) in servers.iter().enumerate() {
-                println!(
-                    "  - {} {}",
-                    srv.server_name,
-                    if i == default_idx { "(default)" } else { "" }
-                );
+                println!("  - {} {}", srv.server_name, if i == default_idx {
+                    "(default)"
+                } else {
+                    ""
+                });
             }
 
-            self.listeners.insert(
-                token,
-                ListenerInfo {
-                    listener,
-                    host,
-                    port,
-                    servers,
-                    default_server_index: default_idx,
-                },
-            );
+            self.listeners.insert(token, ListenerInfo {
+                listener,
+                host,
+                port,
+                servers,
+                default_server_index: default_idx,
+            });
         }
 
         loop {
@@ -482,30 +488,30 @@ impl Server {
                                         .register(
                                             &mut stream,
                                             conn_token,
-                                            Interest::READABLE.add(Interest::WRITABLE),
+                                            Interest::READABLE.add(Interest::WRITABLE)
                                         )
                                         .unwrap();
 
-                                    self.connections.insert(
-                                        conn_token,
-                                        SocketData {
-                                            stream,
-                                            status: SocketStatus {
-                                                ttl: Instant::now(),
-                                                status: Status::Read,
-                                                request: HttpRequestBuilder::new(),
-                                                response: None,
-                                            },
-                                            listener_token: token, // NEW: Track which listener
+                                    self.connections.insert(conn_token, SocketData {
+                                        stream,
+                                        status: SocketStatus {
+                                            ttl: Instant::now(),
+                                            status: Status::Read,
+                                            request: HttpRequestBuilder::new(),
+                                            response: None,
                                         },
-                                    );
+                                        listener_token: token, // NEW: Track which listener
+                                    });
 
                                     println!(
                                         "Accepted connection {:?} from listener {:?}",
-                                        conn_token, token
+                                        conn_token,
+                                        token
                                     );
                                 }
-                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                    break;
+                                }
                                 Err(e) => {
                                     eprintln!("Accept error: {:?}", e);
                                     break;
@@ -520,7 +526,9 @@ impl Server {
                             // NEW: Pass listener_info for server selection
                             let listener_info = self.listeners.get(&socket_data.listener_token);
                             match Server::handle(socket_data, listener_info) {
-                                Some(true) => continue, // State changed, keep going
+                                Some(true) => {
+                                    continue;
+                                } // State changed, keep going
                                 Some(false) => {
                                     break;
                                 } // Would block, need event
@@ -541,7 +549,7 @@ impl Server {
     // CHANGED: Add listener_info parameter for server selection
     pub fn handle(
         socket_data: &mut SocketData,
-        listener_info: Option<&ListenerInfo>,
+        listener_info: Option<&ListenerInfo>
     ) -> Option<bool> {
         match socket_data.status.status {
             Status::Read => handle_read_state(socket_data, listener_info),

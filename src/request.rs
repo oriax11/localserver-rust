@@ -1,6 +1,6 @@
 use crate::utils::{HttpHeaders, HttpMethod};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HttpRequest {
     pub method: HttpMethod,
     pub path: String,
