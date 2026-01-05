@@ -1,3 +1,4 @@
+
 use crate::cgi::run_cgi;
 use crate::config::{Config, Route, ServerConfig};
 use crate::handler::*;
@@ -6,12 +7,15 @@ use crate::request::HttpRequestBuilder;
 use crate::response::{HttpResponseBuilder, detect_content_type, handle_method_not_allowed};
 use crate::router::Router;
 use crate::utils::{HttpHeaders, HttpMethod};
+use crate::utils::session::SessionStore;
+use crate::auth::{handle_login, handle_logout, handle_dashboard, handle_profile, requires_auth};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::net::Shutdown;
+use std::sync::Arc;
 use std::time::Instant;
 
 const LISTENER_TOKEN_START: usize = 0;
@@ -87,7 +91,7 @@ impl FileResponse {
         })
     }
 
-    /// Fill the buffer if it’s empty
+    /// Fill the buffer if it's empty
     fn fill_buffer(&mut self) -> io::Result<()> {
         if self.buf_index >= self.buf_len && !self.finished {
             let n = self.reader.read(&mut self.buffer)?;
@@ -147,32 +151,31 @@ pub struct SocketStatus {
     pub response: Option<Box<dyn HttpResponseCommon>>,
 }
 
-// NEW: Track which listener accepted this connection
 pub struct SocketData {
     pub stream: TcpStream,
     pub status: SocketStatus,
-    pub listener_token: Token, // NEW: Remember which listener this came from
+    pub listener_token: Token,
+    pub session_store: Arc<SessionStore>, // Session store for authentication
 }
 
-// NEW: Information about a listener and its associated servers
 pub struct ListenerInfo {
     listener: TcpListener,
     host: String,
     port: u16,
-    servers: Vec<ServerConfig>, // All servers that share this (host, port)
-    default_server_index: usize, // Index into servers vec for default
+    servers: Vec<ServerConfig>,
+    default_server_index: usize,
 }
 
 pub struct Server {
     poll: Poll,
     events: Events,
-    listeners: HashMap<Token, ListenerInfo>, // CHANGED: Store ListenerInfo instead of TcpListener
+    listeners: HashMap<Token, ListenerInfo>,
     connections: HashMap<Token, SocketData>,
     router: Router,
+    session_store: Arc<SessionStore>, // Session store for authentication
     next_token: usize,
 }
 
-//////////////////////////
 fn build_http_response(
     status_code: u16,
     status_text: &str,
@@ -222,7 +225,6 @@ fn serve_file_or_404(file_path: &str, error_page_path: &str) -> Vec<u8> {
     }
 }
 
-/// Extracts the hostname from the Host header (strips port if present)
 fn extract_hostname(headers: &HttpHeaders) -> &str {
     headers
         .get("host")
@@ -231,7 +233,6 @@ fn extract_hostname(headers: &HttpHeaders) -> &str {
 }
 
 fn select_server<'a>(listener_info: &'a ListenerInfo, hostname: &str) -> &'a ServerConfig {
-    // Try to find a server matching the hostname
     if let Some(srv) = listener_info
         .servers
         .iter()
@@ -244,7 +245,6 @@ fn select_server<'a>(listener_info: &'a ListenerInfo, hostname: &str) -> &'a Ser
         return srv;
     }
 
-    // Fallback to default server
     let default_index = listener_info.default_server_index;
     let default_srv = listener_info.servers.get(default_index).unwrap_or_else(|| {
         panic!(
@@ -300,81 +300,68 @@ fn resolve_file_path(
     let route_root = &route.root;
     let base = format!("{}/{}", server_root, route_root);
 
-    // Canonicalize the base path to get absolute path
     let base_path = match Path::new(&base).canonicalize() {
         Ok(path) => path,
         Err(_) => return None,
     };
 
-    // Determine the relative path to append
     let relative_path = request_path
         .strip_prefix(&route.path)
         .unwrap_or("")
         .trim_start_matches('/');
 
-    // Join base with the relative path and canonicalize
     let full_path = base_path.join(relative_path);
     let canonical = match full_path.canonicalize() {
         Ok(path) => path,
         Err(_) => {
-            // If canonicalize fails (file doesn't exist yet),
-            // validate parent directory instead
             let parent = full_path.parent()?;
             let canonical_parent = parent.canonicalize().ok()?;
             if !canonical_parent.starts_with(&base_path) {
                 return None;
             }
-            // Return the non-canonicalized path since file doesn't exist
             full_path
         }
     };
 
-    // Verify the canonical path is within the base directory
     if canonical.starts_with(&base_path) {
         canonical.to_str().map(|s| s.to_string())
     } else {
         None
     }
 }
-//////
 
-/// Returns Some(true) if request is complete, Some(false) if would block, None on error
 fn read_request(stream: &mut TcpStream, request: &mut HttpRequestBuilder) -> Option<bool> {
     let mut buf = [0u8; 2048];
     loop {
         match stream.read(&mut buf) {
             Ok(0) => {
                 return None;
-            } // Connection closed
+            }
             Ok(n) => {
-                if let Err(e) = request.append(buf[..n].to_vec()) {
+                if let Err(_e) = request.append(buf[..n].to_vec()) {
                     return None;
                 }
                 if request.done() {
-                    return Some(true); // Request complete
+                    return Some(true);
                 }
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                return Some(false); // Would block, need more data
+                return Some(false);
             }
             Err(_) => {
                 return None;
-            } // Error
+            }
         }
     }
 }
 
-/// Writes response data to the stream
-/// Returns Some(true) if should continue, Some(false) if would block, None on error
 fn write_response(
     stream: &mut TcpStream,
     response: &mut Box<dyn HttpResponseCommon>,
 ) -> Option<bool> {
-    response.fill_if_needed().ok()?; // fills file buffer if needed
+    response.fill_if_needed().ok()?;
 
     let data = response.peek();
-
-
 
     if data.is_empty() {
         return Some(true);
@@ -393,7 +380,6 @@ fn write_response(
     }
 }
 
-/// Checks if the connection should be kept alive based on headers
 fn should_keep_alive(request: &crate::request::HttpRequest) -> bool {
     request
         .headers
@@ -402,42 +388,93 @@ fn should_keep_alive(request: &crate::request::HttpRequest) -> bool {
         .unwrap_or(false)
 }
 
-//////////////////////////
-///
-///
-///
-///
 fn handle_read_state(
     socket_data: &mut SocketData,
     listener_info: Option<&ListenerInfo>,
 ) -> Option<bool> {
-    // Read the request
     let read_result = read_request(&mut socket_data.stream, &mut socket_data.status.request);
 
     match read_result {
-        Some(true) => {}       // Request complete
-        other => return other, // Would block or error
+        Some(true) => {}
+        other => return other,
     }
 
     let request: &HttpRequest = socket_data.status.request.get()?;
+
+    // Handle authentication routes
+    if request.path == "/login" && request.method == HttpMethod::POST {
+        let response_bytes = handle_login(request, &socket_data.session_store);
+        socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
+        //kandiro box 7it ma3arfin size dyal dyn response stored in heap
+        socket_data.status.status = Status::Write;
+        println!("fffffffffffffffff{:?}", socket_data.session_store);
+        return Some(true);
+
+        
+    }
+
+    if request.path == "/logout" && request.method == HttpMethod::GET {
+        let response_bytes = handle_logout(request, &socket_data.session_store);
+        socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
+        socket_data.status.status = Status::Write;
+        return Some(true);
+    }
+
+    // Check if path requires authentication
+    if requires_auth(&request.path) {
+        if let Some(session_id) = request.get_session_id() {
+            if let Some(session) = socket_data.session_store.get(session_id) {
+                if !session.is_logged_in() {
+                    // Not logged in, redirect to login
+                    let redirect = b"HTTP/1.1 302 Found\r\nLocation: /login.html\r\n\r\n".to_vec();
+                    socket_data.status.response = Some(Box::new(SimpleResponse::new(redirect)));
+                    socket_data.status.status = Status::Write;
+                    return Some(true);
+                }
+            } else {
+                // No session found, redirect to login
+                let redirect = b"HTTP/1.1 302 Found\r\nLocation: /login.html\r\n\r\n".to_vec();
+                socket_data.status.response = Some(Box::new(SimpleResponse::new(redirect)));
+                socket_data.status.status = Status::Write;
+                return Some(true);
+            }
+        } else {
+            // No session ID, redirect to login
+            let redirect = b"HTTP/1.1 302 Found\r\nLocation: /login.html\r\n\r\n".to_vec();
+            socket_data.status.response = Some(Box::new(SimpleResponse::new(redirect)));
+            socket_data.status.status = Status::Write;
+            return Some(true);
+        }
+    }
+
+    // Handle dashboard and profile routes
+    if request.path == "/dashboard" && request.method == HttpMethod::GET {
+        let response_bytes = handle_dashboard(request, &socket_data.session_store);
+        socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
+        socket_data.status.status = Status::Write;
+        return Some(true);
+    }
+
+    if request.path == "/profile" && request.method == HttpMethod::GET {
+        let response_bytes = handle_profile(request, &socket_data.session_store);
+        socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
+        socket_data.status.status = Status::Write;
+        return Some(true);
+    }
 
     // Select server based on Host header
     let hostname = extract_hostname(&request.headers);
     let info = listener_info.expect("No listener info available");
     let selected_server: &ServerConfig = select_server(info, hostname);
 
-    // Find matching route
     let selected_route = find_matching_route(selected_server, &request.path);
 
-    // Prepare the response
     if let Some(route) = selected_route {
-        // Handle redirect
         if let Some(redirect) = &route.redirect {
             println!("Redirecting request for {} to {}", request.path, redirect);
             let response_bytes = HttpResponseBuilder::redirect(redirect).build();
             socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
         } else {
-            // Check if method is allowed
             let request_method = &request.method;
             let method_allowed = route
                 .methods
@@ -449,12 +486,10 @@ fn handle_read_state(
                 let response_bytes = handle_method_not_allowed(&allowed, &selected_server);
                 socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
             } else {
-                // Resolve file path
                 let file_path = resolve_file_path(selected_server, route, &request.path)
-                    .unwrap_or_else(|| "".to_string()); // Invalid path -> 404
+                    .unwrap_or_else(|| "".to_string());
                 println!("Resolved file path: {}", file_path);
 
-                // CGI check
                 if let Some(cgi_ext) = &route.cgi {
                     if request.path.ends_with(cgi_ext) {
                         println!("CGI detected for path: {}", request.path);
@@ -468,9 +503,40 @@ fn handle_read_state(
                     println!("No CGI for path: {}", request.path);
                 }
 
-                // Serve file (streamed) or handle method
                 let response: Box<dyn HttpResponseCommon> = match request_method {
-                    HttpMethod::GET => handle_get(&file_path, &selected_server, &request),
+                    HttpMethod::GET => {
+                        // Check if it's a directory listing or default file
+                        if route.list_directory == Some(true) {
+                            //Shows all files in a directory as clickable links
+                            let response_bytes = HttpResponseBuilder::serve_directory_listing(
+                                //Like "ls" command in HTML
+                                &selected_server.root,
+                                &route.root,
+                                &route.path,
+                            );
+                            Box::new(SimpleResponse::new(response_bytes))
+                            //When default_file: "index.html" is in config
+                        } else if let Some(default_file) = &route.default_file {
+                            let full_path = format!("{}/{}/{}", selected_server.root, route.root, default_file);
+                            match FileResponse::new(&full_path) {
+                                Ok(file_response) => Box::new(file_response),
+                                Err(_) => {
+                                    let error_path = get_error_page_path(selected_server, 404);
+                                    let response_bytes = serve_file_or_404(&full_path, &error_path);
+                                    Box::new(SimpleResponse::new(response_bytes))
+                                }
+                            }
+                        } else {
+                            match FileResponse::new(&file_path) {
+                                Ok(file_response) => Box::new(file_response),
+                                Err(_) => {
+                                    let error_path = get_error_page_path(selected_server, 404);
+                                    let response_bytes = serve_file_or_404(&file_path, &error_path);
+                                    Box::new(SimpleResponse::new(response_bytes))
+                                }
+                            }
+                        }
+                    }
                     HttpMethod::POST => {
                         let response_bytes = handle_post(&file_path, &request);
                         Box::new(SimpleResponse::new(response_bytes))
@@ -500,18 +566,16 @@ fn handle_read_state(
     Some(true)
 }
 
-/// Handles the Write state: writes response and manages keep-alive
 fn handle_write_state(socket_data: &mut SocketData) -> Option<bool> {
     let response = socket_data.status.response.as_mut()?;
 
-    // Write the response
     let write_result = write_response(&mut socket_data.stream, response);
 
     match write_result {
-        Some(true) => {} // Write complete, check if finished
+        Some(true) => {}
         other => {
             return other;
-        } // Would block or error
+        }
     }
 
     if !response.is_finished() {
@@ -519,26 +583,21 @@ fn handle_write_state(socket_data: &mut SocketData) -> Option<bool> {
         return Some(true);
     }
 
-    // Check for keep-alive
     let request = socket_data.status.request.get()?;
     let keep_alive = should_keep_alive(request);
 
     if keep_alive {
-        // Reset for next request
         socket_data.status.status = Status::Read;
         socket_data.status.request = HttpRequestBuilder::new();
         socket_data.status.response = None;
         println!("Keeping connection alive for next request.");
         Some(true)
     } else {
-        // Close connection
         println!("Closing connection.");
         let _ = socket_data.stream.shutdown(Shutdown::Both);
         None
     }
 }
-
-/// Main handler function
 
 impl Server {
     pub fn new() -> io::Result<Self> {
@@ -548,12 +607,12 @@ impl Server {
             listeners: HashMap::new(),
             connections: HashMap::new(),
             router: Router::new(),
+            session_store: Arc::new(SessionStore::default()),
             next_token: CONNECTION_TOKEN_START,
         })
     }
 
     pub fn run(&mut self, config: Config) -> io::Result<()> {
-        // Step 1: Group servers by (host, port)
         let mut listener_map: HashMap<(String, u16), Vec<(usize, ServerConfig)>> = HashMap::new();
 
         for (idx, server) in config.servers.iter().enumerate() {
@@ -566,8 +625,6 @@ impl Server {
             }
         }
 
-        // println!("listener_map: {:#?}", listener_map);
-        // Step 2: Create one listener per unique (host, port)
         let mut token_counter = LISTENER_TOKEN_START;
 
         for ((host, port), server_list) in listener_map {
@@ -581,7 +638,6 @@ impl Server {
                 .registry()
                 .register(&mut listener, token, Interest::READABLE)?;
 
-            // Determine default server: first one marked as default, or first in list
             let default_idx = server_list
                 .iter()
                 .position(|(_, srv)| srv.default_server)
@@ -621,9 +677,7 @@ impl Server {
             for event in self.events.iter() {
                 let token = event.token();
 
-                // Check if this is a listener token
                 if token.0 < CONNECTION_TOKEN_START {
-                    // Accept all incoming connections
                     if let Some(listener_info) = self.listeners.get_mut(&token) {
                         loop {
                             match listener_info.listener.accept() {
@@ -650,7 +704,8 @@ impl Server {
                                                 request: HttpRequestBuilder::new(),
                                                 response: None,
                                             },
-                                            listener_token: token, // NEW: Track which listener
+                                            listener_token: token,
+                                            session_store: Arc::clone(&self.session_store),
                                         },
                                     );
 
@@ -670,20 +725,17 @@ impl Server {
                         }
                     }
                 } else {
-                    // Handle existing connection
                     if let Some(socket_data) = self.connections.get_mut(&token) {
                         loop {
-                            // NEW: Pass listener_info for server selection
                             let listener_info = self.listeners.get(&socket_data.listener_token);
                             match Server::handle(socket_data, listener_info) {
                                 Some(true) => {
                                     continue;
-                                } // State changed, keep going
+                                }
                                 Some(false) => {
                                     break;
-                                } // Would block, need event
+                                }
                                 None => {
-                                    // Done/error
                                     let _ = socket_data.stream.shutdown(Shutdown::Both);
                                     self.connections.remove(&token);
                                     break;
@@ -696,7 +748,6 @@ impl Server {
         }
     }
 
-    // CHANGED: Add listener_info parameter for server selection
     pub fn handle(
         socket_data: &mut SocketData,
         listener_info: Option<&ListenerInfo>,

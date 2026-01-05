@@ -11,6 +11,11 @@ servers:
       404: "./error_pages/404.html"
       500: "./error_pages/500.html"
     routes:
+      - path: "/login"
+        methods: ["GET"]
+        root: "/var/www/html"
+        default_file: "login.html"
+
       - path: "/"
         methods: ["GET", "POST"]
         root: "/var/www/html"
@@ -25,7 +30,7 @@ servers:
       - path: "/api"
         methods: ["GET", "POST"]
         root: "/var/www/api"
-        redirect: "http://localhost:8080/cgi-bin"
+        redirect: "https://api.example.com"
       
       - path: "/cgi-bin"
         methods: ["GET", "POST"]

@@ -1,4 +1,6 @@
+
 use crate::utils::{HttpHeaders, HttpMethod};
+use crate::utils::cookie::extract_session_id;
 
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
@@ -8,6 +10,7 @@ pub struct HttpRequest {
     pub version: String,
     pub headers: HttpHeaders,
     pub body: Option<Vec<u8>>,
+    pub session_id: Option<String>, // Store session ID
 }
 
 #[derive(Debug)]
@@ -109,10 +112,14 @@ impl HttpRequestBuilder {
             }
         }
         
-        // CHECK FOR CONNECTION IF NULL ADD KEEP ALIVE BY DEFAULT
+        // Add keep-alive by default if not specified
         if !headers.get("connection").is_some() {
             headers.insert("connection", "keep-alive");
         }
+
+        // Extract session ID from Cookie header
+        let cookie_header = headers.get("cookie").map(|s| s.as_str());
+        let session_id = extract_session_id(cookie_header);
 
         let body_type = self.determine_body_type(&headers);
         
@@ -126,6 +133,7 @@ impl HttpRequestBuilder {
             version: parts[2].to_string(),
             headers,
             body: None,
+            session_id,
         });
 
         self.state = ParserState::ParsingBody {
@@ -252,7 +260,6 @@ impl HttpRequestBuilder {
 }
 
 impl HttpRequest {
-    /// Parse the query string into a vector of key-value pairs
     pub fn parse_query(&self) -> Vec<(String, String)> {
         if self.query_string.is_empty() {
             return Vec::new();
@@ -265,7 +272,6 @@ impl HttpRequest {
                 let key = parts.next()?.to_string();
                 let value = parts.next().unwrap_or("").to_string();
                 
-                // URL decode the key and value
                 let key = Self::url_decode(&key);
                 let value = Self::url_decode(&value);
                 
@@ -274,7 +280,6 @@ impl HttpRequest {
             .collect()
     }
 
-    /// Get a specific query parameter value
     pub fn query_param(&self, key: &str) -> Option<String> {
         self.parse_query()
             .into_iter()
@@ -282,14 +287,12 @@ impl HttpRequest {
             .map(|(_, v)| v)
     }
 
-    /// URL decode a string (handles %XX encoding)
     fn url_decode(s: &str) -> String {
         let mut result = String::new();
         let mut chars = s.chars().peekable();
 
         while let Some(ch) = chars.next() {
             if ch == '%' {
-                // Try to parse the next two characters as hex
                 let hex: String = chars.by_ref().take(2).collect();
                 if hex.len() == 2 {
                     if let Ok(byte) = u8::from_str_radix(&hex, 16) {
@@ -297,7 +300,6 @@ impl HttpRequest {
                         continue;
                     }
                 }
-                // If parsing failed, just add the % and continue
                 result.push('%');
                 result.push_str(&hex);
             } else if ch == '+' {
@@ -308,5 +310,9 @@ impl HttpRequest {
         }
 
         result
+    }
+
+    pub fn get_session_id(&self) -> Option<&String> {
+        self.session_id.as_ref()
     }
 }
