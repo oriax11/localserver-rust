@@ -3,14 +3,14 @@ use crate::config::{Config, Route, ServerConfig};
 use crate::handler::*;
 use crate::request::HttpRequest;
 use crate::request::HttpRequestBuilder;
-use crate::response::{HttpResponseBuilder, handle_method_not_allowed};
+use crate::response::{HttpResponseBuilder, detect_content_type, handle_method_not_allowed};
 use crate::router::Router;
 use crate::utils::{HttpHeaders, HttpMethod};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use std::collections::HashMap;
-use std::fs;
-use std::io::{self, Read, Write};
+use std::fs::{self, File};
+use std::io::{self, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::time::Instant;
 
@@ -21,6 +21,7 @@ pub trait HttpResponseCommon {
     fn peek(&self) -> &[u8];
     fn next(&mut self, n: usize);
     fn is_finished(&self) -> bool;
+    fn fill_if_needed(&mut self) -> io::Result<()>;
 }
 
 pub struct SimpleResponse {
@@ -45,6 +46,90 @@ impl HttpResponseCommon for SimpleResponse {
 
     fn is_finished(&self) -> bool {
         self.index >= self.data.len()
+    }
+    fn fill_if_needed(&mut self) -> io::Result<()> {
+        Ok(())
+    } // no-op
+}
+
+pub struct FileResponse {
+    headers: Vec<u8>,
+    headers_index: usize,
+    headers_sent: bool,
+    reader: BufReader<File>,
+    buffer: [u8; 8192],
+    buf_len: usize,
+    buf_index: usize,
+    finished: bool,
+}
+
+impl FileResponse {
+    pub fn new(file_path: &str) -> io::Result<Self> {
+        let content_type = detect_content_type(file_path);
+        let file = File::open(file_path)?;
+        let metadata = file.metadata()?;
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {}\r\n\r\n",
+            metadata.len(),
+            content_type
+        )
+        .into_bytes();
+
+        Ok(Self {
+            headers,
+            headers_sent: false,
+            headers_index: 0,
+            reader: BufReader::new(file),
+            buffer: [0; 8192],
+            buf_len: 0,
+            buf_index: 0,
+            finished: false,
+        })
+    }
+
+    /// Fill the buffer if it’s empty
+    fn fill_buffer(&mut self) -> io::Result<()> {
+        if self.buf_index >= self.buf_len && !self.finished {
+            let n = self.reader.read(&mut self.buffer)?;
+            self.buf_index = 0;
+            self.buf_len = n;
+            if n == 0 {
+                self.finished = true;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl HttpResponseCommon for FileResponse {
+    fn peek(&self) -> &[u8] {
+        if !self.headers_sent {
+            &self.headers[self.headers_index..]
+        } else {
+            &self.buffer[self.buf_index..self.buf_len]
+        }
+    }
+
+    fn next(&mut self, n: usize) {
+        if !self.headers_sent {
+            self.headers_index += n;
+            if self.headers_index >= self.headers.len() {
+                self.headers_sent = true;
+            }
+        } else {
+            self.buf_index += n;
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.headers_sent && self.finished && self.buf_index >= self.buf_len
+    }
+
+    fn fill_if_needed(&mut self) -> io::Result<()> {
+        if self.headers_sent && self.buf_index >= self.buf_len && !self.finished {
+            self.fill_buffer()?;
+        }
+        Ok(())
     }
 }
 
@@ -285,20 +370,26 @@ fn write_response(
     stream: &mut TcpStream,
     response: &mut Box<dyn HttpResponseCommon>,
 ) -> Option<bool> {
-    loop {
-        let data = response.peek();
-        if data.is_empty() {
-            return Some(true); // Write complete
-        }
-        match stream.write(data) {
-            Ok(n) => response.next(n),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                return Some(false); // Would block
+    response.fill_if_needed().ok()?; // fills file buffer if needed
+
+    let data = response.peek();
+
+
+
+    if data.is_empty() {
+        return Some(true);
+    }
+    match stream.write(data) {
+        Ok(n) => {
+            response.next(n);
+            if response.is_finished() {
+                Some(false)
+            } else {
+                Some(true)
             }
-            Err(_) => {
-                return None;
-            } // Error
         }
+        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Some(false),
+        Err(_) => None,
     }
 }
 
@@ -324,13 +415,10 @@ fn handle_read_state(
     let read_result = read_request(&mut socket_data.stream, &mut socket_data.status.request);
 
     match read_result {
-        Some(true) => {} // Request complete, continue processing
-        other => {
-            return other;
-        } // Would block or error
+        Some(true) => {}       // Request complete
+        other => return other, // Would block or error
     }
 
-    // Parse request
     let request: &HttpRequest = socket_data.status.request.get()?;
 
     // Select server based on Host header
@@ -341,73 +429,74 @@ fn handle_read_state(
     // Find matching route
     let selected_route = find_matching_route(selected_server, &request.path);
 
-    let response_bytes = match selected_route {
-        Some(route) => {
-            // handle redirect
-            if let Some(redirect) = &route.redirect {
-                println!("Redirecting request for {} to {}", request.path, redirect);
-                HttpResponseBuilder::redirect(redirect).build()
+    // Prepare the response
+    if let Some(route) = selected_route {
+        // Handle redirect
+        if let Some(redirect) = &route.redirect {
+            println!("Redirecting request for {} to {}", request.path, redirect);
+            let response_bytes = HttpResponseBuilder::redirect(redirect).build();
+            socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
+        } else {
+            // Check if method is allowed
+            let request_method = &request.method;
+            let method_allowed = route
+                .methods
+                .iter()
+                .any(|m| HttpMethod::from_str(m) == *request_method);
+
+            if !method_allowed {
+                let allowed = &route.methods;
+                let response_bytes = handle_method_not_allowed(&allowed, &selected_server);
+                socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
             } else {
-                // Check if method is allowed
-                let request_method = &request.method;
-                let method_allowed = route
-                    .methods
-                    .iter()
-                    .any(|m| HttpMethod::from_str(m) == *request_method);
+                // Resolve file path
+                let file_path = resolve_file_path(selected_server, route, &request.path)
+                    .unwrap_or_else(|| "".to_string()); // Invalid path -> 404
+                println!("Resolved file path: {}", file_path);
 
-                if !method_allowed {
-                    let allowed = &route.methods;
-
-                    handle_method_not_allowed(&allowed, &selected_server)
-                } else {
-                    let file_path = resolve_file_path(selected_server, route, &request.path);
-                    // check if file path is valid
-                    let file_path = match file_path {
-                        Some(fp) => fp,
-                        None => "".to_string(), // Invalid path, will trigger 404
-                    };
-                    println!("Resolved file path: {}", file_path);
-
-                    //CGI CHECK
-                    if let Some(cgi_ext) = &route.cgi {
-                        if request.path.ends_with(cgi_ext) {
-                            println!("CGI detected for path: {}", request.path);
-
-                            let cgi_context = crate::cgi::CgiContext::from_request(request);
-
-                            if run_cgi(route, cgi_context, &file_path, socket_data) {
-                                return Some(true);
-                            } else {
-                                return None;
-                            }
+                // CGI check
+                if let Some(cgi_ext) = &route.cgi {
+                    if request.path.ends_with(cgi_ext) {
+                        println!("CGI detected for path: {}", request.path);
+                        let cgi_context = crate::cgi::CgiContext::from_request(request);
+                        if run_cgi(route, cgi_context, &file_path, socket_data) {
+                            return Some(true);
+                        } else {
+                            return None;
                         }
                     }
-                    // Handle based on method
-                    match request_method {
-                        HttpMethod::GET => handle_get(&file_path, &selected_server, &request),
-                        HttpMethod::POST => handle_post(&file_path, &request),
-                        HttpMethod::DELETE => {
-                            handle_delete(&file_path, &get_error_page_path(selected_server, 404))
-                        }
-                        HttpMethod::Other(_) => {
-                            let allowed = &route.methods;
-                            handle_method_not_allowed(&allowed, &selected_server)
-                        }
-                    }
+                    println!("No CGI for path: {}", request.path);
                 }
+
+                // Serve file (streamed) or handle method
+                let response: Box<dyn HttpResponseCommon> = match request_method {
+                    HttpMethod::GET => handle_get(&file_path, &selected_server, &request),
+                    HttpMethod::POST => {
+                        let response_bytes = handle_post(&file_path, &request);
+                        Box::new(SimpleResponse::new(response_bytes))
+                    }
+                    HttpMethod::DELETE => {
+                        let error_path = get_error_page_path(selected_server, 404);
+                        let response_bytes = handle_delete(&file_path, &error_path);
+                        Box::new(SimpleResponse::new(response_bytes))
+                    }
+                    HttpMethod::Other(_) => {
+                        let allowed = &route.methods;
+                        let response_bytes = handle_method_not_allowed(&allowed, &selected_server);
+                        Box::new(SimpleResponse::new(response_bytes))
+                    }
+                };
+
+                socket_data.status.response = Some(response);
             }
         }
-        None => HttpResponseBuilder::serve_error_page(
-            &get_error_page_path(selected_server, 404),
-            404,
-            "Not Found",
-        ),
-    };
+    } else {
+        let error_path = get_error_page_path(selected_server, 404);
+        let response_bytes = HttpResponseBuilder::serve_error_page(&error_path, 404, "Not Found");
+        socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
+    }
 
-    // Set response and transition to Write state
-    socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
     socket_data.status.status = Status::Write;
-
     Some(true)
 }
 
@@ -425,8 +514,8 @@ fn handle_write_state(socket_data: &mut SocketData) -> Option<bool> {
         } // Would block or error
     }
 
-    // Check if response is finished
     if !response.is_finished() {
+        println!("Response not finished yet.");
         return Some(true);
     }
 
@@ -439,6 +528,7 @@ fn handle_write_state(socket_data: &mut SocketData) -> Option<bool> {
         socket_data.status.status = Status::Read;
         socket_data.status.request = HttpRequestBuilder::new();
         socket_data.status.response = None;
+        println!("Keeping connection alive for next request.");
         Some(true)
     } else {
         // Close connection

@@ -99,7 +99,6 @@ impl HttpResponseBuilder {
         let dir_path = format!("{}/{}", server_root, route_root);
         if let Ok(entries) = fs::read_dir(dir_path) {
             for entry in entries {
-                println!("Reading directory entry for listing");
                 if let Ok(entry) = entry {
                     let file_name = entry.file_name();
                     let file_name_str = file_name.to_string_lossy();
@@ -167,25 +166,20 @@ impl HttpResponseBuilder {
 }
 
 // Helper function to detect content type from file extension
-fn detect_content_type(path: &str) -> &'static str {
-    if path.ends_with(".html") || path.ends_with(".htm") {
-        "text/html"
-    } else if path.ends_with(".css") {
-        "text/css"
-    } else if path.ends_with(".js") {
-        "application/javascript"
-    } else if path.ends_with(".json") {
-        "application/json"
-    } else if path.ends_with(".png") {
-        "image/png"
-    } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
-        "image/jpeg"
-    } else if path.ends_with(".gif") {
-        "image/gif"
-    } else if path.ends_with(".svg") {
-        "image/svg+xml"
-    } else if path.ends_with(".txt") {
-        "text/plain"
+pub fn detect_content_type(path: &str) -> &'static str {
+    if let Some(ext) = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+    {
+        match ext {
+            "html" => "text/html",
+            "css" => "text/css",
+            "js" => "application/javascript",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            _ => "application/octet-stream",
+        }
     } else {
         "application/octet-stream"
     }

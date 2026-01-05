@@ -1,6 +1,6 @@
 servers:
   - server_name: "example.com"
-    host: 127.0.0.1
+    host: 0.0.0.0
     ports:
       - 8080
       - 8081
@@ -25,7 +25,7 @@ servers:
       - path: "/api"
         methods: ["GET", "POST"]
         root: "/var/www/api"
-        redirect: "https://api.example.com"
+        redirect: "http://localhost:8080/cgi-bin"
       
       - path: "/cgi-bin"
         methods: ["GET", "POST"]
@@ -36,7 +36,7 @@ servers:
   - server_name: "blog.example.com"
     host: 127.0.0.1
     ports:
-      - 8080
+      - 8082
     default_server: false
     routes:
       - path: "/"

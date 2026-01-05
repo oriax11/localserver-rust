@@ -1,10 +1,19 @@
-use crate::{config::ServerConfig, request::HttpRequest, response::{HttpResponseBuilder, extract_boundary, extract_multipart_files, write_file}};
+use crate::error::get_error_page_path;
+use crate::{
+    config::ServerConfig,
+    request::HttpRequest,
+    response::{HttpResponseBuilder, extract_boundary, extract_multipart_files, write_file},
+    server::{FileResponse, HttpResponseCommon, SimpleResponse},
+};
 use std::fs;
 use uuid::Uuid;
-use crate::error::get_error_page_path;
 
-pub fn handle_get(request_path: &str, server: &ServerConfig, request: &HttpRequest) -> Vec<u8> {
-    // trim request path from leading '/' or trailing '/'
+pub fn handle_get(
+    request_path: &str,
+    server: &ServerConfig,
+    request: &HttpRequest,
+) -> Box<dyn HttpResponseCommon> {
+    // Trim request path from leading/trailing '/'
     let path = request.path.trim_matches('/');
     println!("Handling GET for path: {}", path);
 
@@ -15,32 +24,43 @@ pub fn handle_get(request_path: &str, server: &ServerConfig, request: &HttpReque
     {
         // Directory listing allowed?
         if route.list_directory == Some(true) {
-            return HttpResponseBuilder::serve_directory_listing(
+            let content = HttpResponseBuilder::serve_directory_listing(
                 &server.root,
                 &route.root,
                 &route.path,
             );
+            return Box::new(SimpleResponse::new(content));
         }
+
         // Default file exists? Serve it
         if let Some(default_file) = &route.default_file {
             let server_root = &server.root;
             let root = &route.root;
             let full_path = format!("{}/{}/{}", server_root, root, default_file);
-
-            println!(
-                "Serving default file for route {}: {}",
-                route.path, full_path
-            );
-            return HttpResponseBuilder::serve_file_or_404(
-                &full_path,
-                &get_error_page_path(server, 404),
-            );
+            match FileResponse::new(&full_path) {
+                Ok(file_response) => {
+                    return Box::new(file_response);
+                }
+                Err(_) => {
+                    return Box::new(SimpleResponse::new(
+                        HttpResponseBuilder::not_found().build(),
+                    ));
+                }
+            }
         }
     }
 
-    // If no route or no listing/default file, try to serve the requested file directly
-    let error_page_path = get_error_page_path(server, 404);
-    HttpResponseBuilder::serve_file_or_404(request_path, &error_page_path)
+    // If no route/default file, serve requested file directly
+    match FileResponse::new(&request_path) {
+        Ok(file_response) => {
+            return Box::new(file_response);
+        }
+        Err(_) => {
+            return Box::new(SimpleResponse::new(
+                HttpResponseBuilder::not_found().build(),
+            ));
+        }
+    }
 }
 
 pub fn handle_delete(file_path: &str, error_page_path: &str) -> Vec<u8> {
@@ -55,7 +75,6 @@ pub fn handle_delete(file_path: &str, error_page_path: &str) -> Vec<u8> {
         }
     }
 }
-
 
 pub fn handle_post(file_path: &str, request: &HttpRequest) -> Vec<u8> {
     let body = match &request.body {
@@ -172,6 +191,3 @@ pub fn handle_post(file_path: &str, request: &HttpRequest) -> Vec<u8> {
             .build()
     }
 }
-
-
-
