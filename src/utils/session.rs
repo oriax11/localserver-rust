@@ -1,38 +1,31 @@
-
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+use crate::request::HttpRequest;
+use crate::utils::cookie::Cookie;
 
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: String,
-    pub user_id: Option<String>,
-    pub username: Option<String>,
     pub created_at: Instant,
     pub expires_at: Instant,
     pub data: HashMap<String, String>,
 }
 
 impl Session {
-    pub fn new(session_id: Option<String>) -> Self {
-        let id = session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    pub fn new() -> Self {
+        let id = Uuid::new_v4().to_string();
         let now = Instant::now();
-        
+
         Session {
             id,
-            user_id: None,
-            username: None,
             created_at: now,
-            expires_at: now + Duration::from_secs(3600), // 1 hour default
+            expires_at: now + Duration::from_secs(3600), 
             data: HashMap::new(),
         }
-    }
-
-    pub fn with_user(mut self, user_id: &str, username: &str) -> Self {
-        self.user_id = Some(user_id.to_string());
-        self.username = Some(username.to_string());
-        self
     }
 
     pub fn set_expiry(&mut self, duration: Duration) {
@@ -55,73 +48,43 @@ impl Session {
         Instant::now() >= self.expires_at
     }
 
-    pub fn is_logged_in(&self) -> bool {
-        self.user_id.is_some() && !self.is_expired()
-    }
-
     pub fn renew(&mut self) {
         self.expires_at = Instant::now() + Duration::from_secs(3600);
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct SessionStore {
-    sessions: Arc<RwLock<HashMap<String, Session>>>,
-    //rwlock read write lock to allow many readers or one writer at a time
-    //arc Atomic Reference Counting to allow safe sharing across threads
-    cleanup_interval: Duration,
-}
-
-impl Default for SessionStore {
-    fn default() -> Self {
-        Self::new(Duration::from_secs(300)) // Cleanup every 5 minutes
-    }
+    inner: Rc<RefCell<HashMap<String, Session>>>,
 }
 
 impl SessionStore {
-    pub fn new(cleanup_interval: Duration) -> Self {
-        let store = SessionStore {
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            cleanup_interval,
-        };
-        
-        // Start cleanup task
-        store.start_cleanup();
-        
-        store
-    }
-
-    /// Create a new session for a user
-    pub fn create_with_user(&self, user_id: &str, username: &str) -> Session {
-        let session = Session::new(None).with_user(user_id, username);
-        self.sessions.write()
-            .expect("Failed to acquire write lock on sessions")
-            .insert(session.id.clone(), session.clone());
-        session
+    pub fn new() -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(HashMap::new())),
+        }
     }
 
     /// Create a new anonymous session
     pub fn create(&self) -> Session {
-        let session = Session::new(None);
-        self.sessions.write()
-            .expect("Failed to acquire write lock on sessions")
+        let session = Session::new();
+        self.inner
+            .borrow_mut()
             .insert(session.id.clone(), session.clone());
         session
     }
 
     /// Get a session by ID
     pub fn get(&self, session_id: &str) -> Option<Session> {
-        let sessions = self.sessions.read()
-            .expect("Failed to acquire read lock on sessions");
-        
+        let sessions = self.inner.borrow();
         sessions.get(session_id).cloned()
     }
 
     /// Update a session
+    /// Update a session
     pub fn update(&self, session: &Session) -> bool {
-        let mut sessions = self.sessions.write()
-            .expect("Failed to acquire write lock on sessions");
-        
+        let mut sessions = self.inner.borrow_mut();
+
         if sessions.contains_key(&session.id) {
             sessions.insert(session.id.clone(), session.clone());
             true
@@ -130,55 +93,61 @@ impl SessionStore {
         }
     }
 
-    /// Destroy a session by ID
-    pub fn destroy(&self, session_id: &str) -> bool {
-        self.sessions.write()
-            .expect("Failed to acquire write lock on sessions")
-            .remove(session_id)
-            .is_some()
-    }
-
     /// Clean up expired sessions
     pub fn cleanup(&self) -> usize {
-        let mut sessions = self.sessions.write()
-            .expect("Failed to acquire write lock on sessions");
-        
+        let mut sessions = self.inner.borrow_mut();
         let before = sessions.len();
         sessions.retain(|_, session| !session.is_expired());
-        let after = sessions.len();
-        
-        before - after
+        before - sessions.len()
     }
 
-    /// Get all active sessions
-    pub fn get_all(&self) -> Vec<Session> {
-        let sessions = self.sessions.read()
-            .expect("Failed to acquire read lock on sessions");
-        
-        sessions.values().cloned().collect()
-    }
-
-    /// Start background cleanup task
-    fn start_cleanup(&self) {
-        let store = self.clone();
-        
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(store.cleanup_interval);
-                let removed = store.cleanup();
-                if removed > 0 {
-                    println!("Session cleanup: removed {} expired sessions", removed);
-                }
-            }
-        });
+    pub fn with_session<F>(&self, session_id: &str, mut f: F) -> bool
+    where
+        F: FnMut(&mut Session),
+    {
+        let mut sessions = self.inner.borrow_mut();
+        if let Some(session) = sessions.get_mut(session_id) {
+            f(session);
+            true
+        } else {
+            false
+        }
     }
 }
 
-impl Clone for SessionStore {
-    fn clone(&self) -> Self {
-        SessionStore {
-            sessions: Arc::clone(&self.sessions),
-            cleanup_interval: self.cleanup_interval,
-        }
+pub fn handle_session(request: &HttpRequest, session_store: &mut SessionStore) -> Cookie {
+    if let Some(session_id) = &request.session_id {
+        // Existing session: increment visits and renew expiry
+        session_store.with_session(session_id, |session| {
+            let visits = session
+                .data
+                .get("visits")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0);
+            session
+                .data
+                .insert("visits".to_string(), (visits + 1).to_string());
+            session.renew();
+        });
+
+        // Return cookie (refresh max_age)
+        Cookie::new("session_id", session_id)
+            .path("/")
+            .http_only(true)
+            .max_age(3600)
+    } else {
+        // No session: create new
+        let mut session = session_store.create();
+        session.data.insert("visits".to_string(), "1".to_string());
+        let new_session_id = session.id.clone();
+
+        // Save session in store
+        session_store.update(&session);
+
+        // Create Set-Cookie header
+        Cookie::new("session_id", &new_session_id)
+            .path("/")
+            .http_only(true)
+            .max_age(3600)
     }
 }

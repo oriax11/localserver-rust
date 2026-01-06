@@ -1,4 +1,5 @@
 use crate::error::get_error_page_path;
+use crate::utils::cookie::{self, Cookie};
 use crate::{
     config::ServerConfig,
     request::HttpRequest,
@@ -12,10 +13,10 @@ pub fn handle_get(
     request_path: &str,
     server: &ServerConfig,
     request: &HttpRequest,
+    cookie: &Cookie,
 ) -> Box<dyn HttpResponseCommon> {
     // Trim request path from leading/trailing '/'
     let path = request.path.trim_matches('/');
-    println!("Handling GET for path: {}", path);
 
     if let Some(route) = server
         .routes
@@ -28,12 +29,15 @@ pub fn handle_get(
                 &server.root,
                 &route.root,
                 &route.path,
+                &cookie,
             );
             return Box::new(SimpleResponse::new(content));
         }
 
         // Default file exists? Serve it
         if let Some(default_file) = &route.default_file {
+            let (key, value) = cookie.to_header_pair();
+
             let server_root = &server.root;
             let root = &route.root;
             let full_path = format!("{}/{}/{}", server_root, root, default_file);
@@ -43,7 +47,9 @@ pub fn handle_get(
                 }
                 Err(_) => {
                     return Box::new(SimpleResponse::new(
-                        HttpResponseBuilder::not_found().build(),
+                        HttpResponseBuilder::not_found()
+                            .header(&key, &value)
+                            .build(),
                     ));
                 }
             }
@@ -63,7 +69,7 @@ pub fn handle_get(
     }
 }
 
-pub fn handle_delete(file_path: &str, error_page_path: &str) -> Vec<u8> {
+pub fn handle_delete(file_path: &str, error_page_path: &str , cookie :&Cookie) -> Vec<u8> {
     match fs::remove_file(file_path) {
         Ok(_) => {
             println!("DELETE: Successfully deleted {}", file_path);
@@ -71,12 +77,12 @@ pub fn handle_delete(file_path: &str, error_page_path: &str) -> Vec<u8> {
         }
         Err(_) => {
             println!("DELETE: File not found {}", file_path);
-            HttpResponseBuilder::serve_error_page(error_page_path, 404, "Not Found")
+            HttpResponseBuilder::serve_error_page(error_page_path, 404, "Not Found", cookie)
         }
     }
 }
 
-pub fn handle_post(file_path: &str, request: &HttpRequest) -> Vec<u8> {
+pub fn handle_post(file_path: &str, request: &HttpRequest , cookie: &Cookie) -> Vec<u8> {
     let body = match &request.body {
         Some(b) => b,
         None => {
@@ -132,7 +138,7 @@ pub fn handle_post(file_path: &str, request: &HttpRequest) -> Vec<u8> {
             format!("{}", file_path)
         };
 
-        return write_file(&save_path, body);
+        return write_file(&save_path, body, cookie);
     }
 
     if content_type.starts_with("multipart/form-data") {
@@ -166,7 +172,7 @@ pub fn handle_post(file_path: &str, request: &HttpRequest) -> Vec<u8> {
                 format!("{}/{}", file_path, filename)
             };
 
-            let response = write_file(&save_path, file_bytes);
+            let response = write_file(&save_path, file_bytes , cookie);
             // Check if write failed
             if response.starts_with(b"HTTP/1.1 500") || response.starts_with(b"HTTP/1.1 4") {
                 return response;

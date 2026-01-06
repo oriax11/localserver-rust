@@ -1,4 +1,3 @@
-
 use crate::cgi::run_cgi;
 use crate::config::{Config, Route, ServerConfig};
 use crate::handler::*;
@@ -6,16 +5,15 @@ use crate::request::HttpRequest;
 use crate::request::HttpRequestBuilder;
 use crate::response::{HttpResponseBuilder, detect_content_type, handle_method_not_allowed};
 use crate::router::Router;
+use crate::utils::cookie::Cookie;
+use crate::utils::session::{SessionStore, handle_session};
 use crate::utils::{HttpHeaders, HttpMethod};
-use crate::utils::session::SessionStore;
-use crate::auth::{handle_login, handle_logout, handle_dashboard, handle_profile, requires_auth};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::net::Shutdown;
-use std::sync::Arc;
 use std::time::Instant;
 
 const LISTENER_TOKEN_START: usize = 0;
@@ -401,78 +399,20 @@ fn handle_read_state(
 
     let request: &HttpRequest = socket_data.status.request.get()?;
 
-    // Handle authentication routes
-    if request.path == "/login" && request.method == HttpMethod::POST {
-        let response_bytes = handle_login(request, &socket_data.session_store);
-        socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
-        //kandiro box 7it ma3arfin size dyal dyn response stored in heap
-        socket_data.status.status = Status::Write;
-        println!("fffffffffffffffff{:?}", socket_data.session_store);
-        return Some(true);
-
-        
-    }
-
-    if request.path == "/logout" && request.method == HttpMethod::GET {
-        let response_bytes = handle_logout(request, &socket_data.session_store);
-        socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
-        socket_data.status.status = Status::Write;
-        return Some(true);
-    }
-
-    // Check if path requires authentication
-    if requires_auth(&request.path) {
-        if let Some(session_id) = request.get_session_id() {
-            if let Some(session) = socket_data.session_store.get(session_id) {
-                if !session.is_logged_in() {
-                    // Not logged in, redirect to login
-                    let redirect = b"HTTP/1.1 302 Found\r\nLocation: /login.html\r\n\r\n".to_vec();
-                    socket_data.status.response = Some(Box::new(SimpleResponse::new(redirect)));
-                    socket_data.status.status = Status::Write;
-                    return Some(true);
-                }
-            } else {
-                // No session found, redirect to login
-                let redirect = b"HTTP/1.1 302 Found\r\nLocation: /login.html\r\n\r\n".to_vec();
-                socket_data.status.response = Some(Box::new(SimpleResponse::new(redirect)));
-                socket_data.status.status = Status::Write;
-                return Some(true);
-            }
-        } else {
-            // No session ID, redirect to login
-            let redirect = b"HTTP/1.1 302 Found\r\nLocation: /login.html\r\n\r\n".to_vec();
-            socket_data.status.response = Some(Box::new(SimpleResponse::new(redirect)));
-            socket_data.status.status = Status::Write;
-            return Some(true);
-        }
-    }
-
-    // Handle dashboard and profile routes
-    if request.path == "/dashboard" && request.method == HttpMethod::GET {
-        let response_bytes = handle_dashboard(request, &socket_data.session_store);
-        socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
-        socket_data.status.status = Status::Write;
-        return Some(true);
-    }
-
-    if request.path == "/profile" && request.method == HttpMethod::GET {
-        let response_bytes = handle_profile(request, &socket_data.session_store);
-        socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
-        socket_data.status.status = Status::Write;
-        return Some(true);
-    }
+    // handle cookies and sessions
+    let cookie: Cookie = handle_session(request, &mut socket_data.session_store);
 
     // Select server based on Host header
     let hostname = extract_hostname(&request.headers);
     let info = listener_info.expect("No listener info available");
     let selected_server: &ServerConfig = select_server(info, hostname);
 
+
     let selected_route = find_matching_route(selected_server, &request.path);
 
     if let Some(route) = selected_route {
         if let Some(redirect) = &route.redirect {
-            println!("Redirecting request for {} to {}", request.path, redirect);
-            let response_bytes = HttpResponseBuilder::redirect(redirect).build();
+            let response_bytes = HttpResponseBuilder::redirect(redirect).cookie(&cookie).build();
             socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
         } else {
             let request_method = &request.method;
@@ -483,16 +423,14 @@ fn handle_read_state(
 
             if !method_allowed {
                 let allowed = &route.methods;
-                let response_bytes = handle_method_not_allowed(&allowed, &selected_server);
+                let response_bytes = handle_method_not_allowed(&allowed, &selected_server , &cookie);
                 socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
             } else {
                 let file_path = resolve_file_path(selected_server, route, &request.path)
                     .unwrap_or_else(|| "".to_string());
-                println!("Resolved file path: {}", file_path);
 
                 if let Some(cgi_ext) = &route.cgi {
                     if request.path.ends_with(cgi_ext) {
-                        println!("CGI detected for path: {}", request.path);
                         let cgi_context = crate::cgi::CgiContext::from_request(request);
                         if run_cgi(route, cgi_context, &file_path, socket_data) {
                             return Some(true);
@@ -500,55 +438,24 @@ fn handle_read_state(
                             return None;
                         }
                     }
-                    println!("No CGI for path: {}", request.path);
                 }
 
                 let response: Box<dyn HttpResponseCommon> = match request_method {
                     HttpMethod::GET => {
-                        // Check if it's a directory listing or default file
-                        if route.list_directory == Some(true) {
-                            //Shows all files in a directory as clickable links
-                            let response_bytes = HttpResponseBuilder::serve_directory_listing(
-                                //Like "ls" command in HTML
-                                &selected_server.root,
-                                &route.root,
-                                &route.path,
-                            );
-                            Box::new(SimpleResponse::new(response_bytes))
-                            //When default_file: "index.html" is in config
-                        } else if let Some(default_file) = &route.default_file {
-                            let full_path = format!("{}/{}/{}", selected_server.root, route.root, default_file);
-                            match FileResponse::new(&full_path) {
-                                Ok(file_response) => Box::new(file_response),
-                                Err(_) => {
-                                    let error_path = get_error_page_path(selected_server, 404);
-                                    let response_bytes = serve_file_or_404(&full_path, &error_path);
-                                    Box::new(SimpleResponse::new(response_bytes))
-                                }
-                            }
-                        } else {
-                            match FileResponse::new(&file_path) {
-                                Ok(file_response) => Box::new(file_response),
-                                Err(_) => {
-                                    let error_path = get_error_page_path(selected_server, 404);
-                                    let response_bytes = serve_file_or_404(&file_path, &error_path);
-                                    Box::new(SimpleResponse::new(response_bytes))
-                                }
-                            }
-                        }
+                        handle_get(&file_path, &selected_server, &request, &cookie)
                     }
                     HttpMethod::POST => {
-                        let response_bytes = handle_post(&file_path, &request);
+                        let response_bytes = handle_post(&file_path, &request , &cookie);
                         Box::new(SimpleResponse::new(response_bytes))
                     }
                     HttpMethod::DELETE => {
                         let error_path = get_error_page_path(selected_server, 404);
-                        let response_bytes = handle_delete(&file_path, &error_path);
+                        let response_bytes = handle_delete(&file_path, &error_path , &cookie);
                         Box::new(SimpleResponse::new(response_bytes))
                     }
                     HttpMethod::Other(_) => {
                         let allowed = &route.methods;
-                        let response_bytes = handle_method_not_allowed(&allowed, &selected_server);
+                        let response_bytes = handle_method_not_allowed(&allowed, &selected_server , &cookie);
                         Box::new(SimpleResponse::new(response_bytes))
                     }
                 };
@@ -558,7 +465,7 @@ fn handle_read_state(
         }
     } else {
         let error_path = get_error_page_path(selected_server, 404);
-        let response_bytes = HttpResponseBuilder::serve_error_page(&error_path, 404, "Not Found");
+        let response_bytes = HttpResponseBuilder::serve_error_page(&error_path, 404, "Not Found" , &cookie);
         socket_data.status.response = Some(Box::new(SimpleResponse::new(response_bytes)));
     }
 
@@ -607,7 +514,7 @@ impl Server {
             listeners: HashMap::new(),
             connections: HashMap::new(),
             router: Router::new(),
-            session_store: SessionStore::default(),
+            session_store: SessionStore::new(),
             next_token: CONNECTION_TOKEN_START,
         })
     }

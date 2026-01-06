@@ -7,7 +7,6 @@ pub mod server;
 pub mod utils;
 pub(crate) mod response;
 pub mod handler;
-pub mod auth;
 
 use server::Server;
 

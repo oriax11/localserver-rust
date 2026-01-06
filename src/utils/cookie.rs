@@ -1,4 +1,3 @@
-
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone)]
@@ -82,41 +81,45 @@ impl Cookie {
     /// Convert cookie to header value string
     pub fn to_header_value(&self) -> String {
         let mut parts = Vec::new();
-        
+
         // Name=Value
-        parts.push(format!("{}={}", self.name, urlencoding::encode(&self.value)));
-        
+        parts.push(format!(
+            "{}={}",
+            self.name,
+            urlencoding::encode(&self.value)
+        ));
+
         // Path
         if let Some(path) = &self.path {
             parts.push(format!("Path={}", path));
         }
-        
+
         // Domain
         if let Some(domain) = &self.domain {
             parts.push(format!("Domain={}", domain));
         }
-        
+
         // Max-Age
         if let Some(max_age) = &self.max_age {
             parts.push(format!("Max-Age={}", max_age.as_secs()));
         }
-        
+
         // Expires
         if let Some(expires) = &self.expires {
             let formatted = httpdate::fmt_http_date(*expires);
             parts.push(format!("Expires={}", formatted));
         }
-        
+
         // Secure
         if self.secure {
             parts.push("Secure".to_string());
         }
-        
+
         // HttpOnly
         if self.http_only {
             parts.push("HttpOnly".to_string());
         }
-        
+
         // SameSite
         if let Some(same_site) = &self.same_site {
             let value = match same_site {
@@ -126,8 +129,48 @@ impl Cookie {
             };
             parts.push(format!("SameSite={}", value));
         }
-        
+
         parts.join("; ")
+    }
+    pub fn to_header_pair(&self) -> (String, String) {
+        let mut parts = Vec::new();
+
+        // Name=Value
+        parts.push(format!(
+            "{}={}",
+            self.name,
+            urlencoding::encode(&self.value)
+        ));
+
+        if let Some(path) = &self.path {
+            parts.push(format!("Path={}", path));
+        }
+        if let Some(domain) = &self.domain {
+            parts.push(format!("Domain={}", domain));
+        }
+        if let Some(max_age) = &self.max_age {
+            parts.push(format!("Max-Age={}", max_age.as_secs()));
+        }
+        if let Some(expires) = &self.expires {
+            let formatted = httpdate::fmt_http_date(*expires);
+            parts.push(format!("Expires={}", formatted));
+        }
+        if self.secure {
+            parts.push("Secure".to_string());
+        }
+        if self.http_only {
+            parts.push("HttpOnly".to_string());
+        }
+        if let Some(same_site) = &self.same_site {
+            let value = match same_site {
+                SameSite::Strict => "Strict",
+                SameSite::Lax => "Lax",
+                SameSite::None => "None",
+            };
+            parts.push(format!("SameSite={}", value));
+        }
+
+        ("Set-Cookie".to_string(), parts.join("; "))
     }
 
     /// Parse a cookie from a Cookie header value
@@ -139,7 +182,7 @@ impl Cookie {
                 if part.is_empty() {
                     return None;
                 }
-                
+
                 if let Some((name, value)) = part.split_once('=') {
                     Some(Cookie::new(name.trim(), value.trim()))
                 } else {
