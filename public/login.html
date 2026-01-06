@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Login</title>
+    <style>
+        body { font-family: Arial; max-width: 400px; margin: 50px auto; padding: 20px; }
+        .login-form { background: #f9f9f9; padding: 30px; border-radius: 5px; }
+        input { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; }
+        button { background: #4CAF50; color: white; padding: 10px 20px; border: none; cursor: pointer; }
+        .test-accounts { margin-top: 20px; font-size: 0.9em; color: #666; }
+    </style>
+</head>
+<body>
+    <div class="login-form">
+        <h2>Login</h2>
+        <form action="/login" method="POST">
+            <input type="text" name="username" placeholder="Username" required>
+            <input type="password" name="password" placeholder="Password" required>
+            <button type="submit">Login</button>
+        </form>
+        
+        <div class="test-accounts">
+            <h3>Test Accounts:</h3>
+            <ul>
+                <li><strong>admin / admin123</strong></li>
+                <li><strong>user / user123</strong></li>
+                <li><strong>test / test123</strong></li>
+            </ul>
+        </div>
+    </div>
+</body>
+</html>

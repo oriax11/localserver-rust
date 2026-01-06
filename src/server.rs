@@ -155,7 +155,7 @@ pub struct SocketData {
     pub stream: TcpStream,
     pub status: SocketStatus,
     pub listener_token: Token,
-    pub session_store: Arc<SessionStore>, // Session store for authentication
+    pub session_store: SessionStore, // Session store for authentication
 }
 
 pub struct ListenerInfo {
@@ -172,7 +172,7 @@ pub struct Server {
     listeners: HashMap<Token, ListenerInfo>,
     connections: HashMap<Token, SocketData>,
     router: Router,
-    session_store: Arc<SessionStore>, // Session store for authentication
+    session_store: SessionStore, // Session store for authentication
     next_token: usize,
 }
 
@@ -607,7 +607,7 @@ impl Server {
             listeners: HashMap::new(),
             connections: HashMap::new(),
             router: Router::new(),
-            session_store: Arc::new(SessionStore::default()),
+            session_store: SessionStore::default(),
             next_token: CONNECTION_TOKEN_START,
         })
     }
@@ -705,7 +705,7 @@ impl Server {
                                                 response: None,
                                             },
                                             listener_token: token,
-                                            session_store: Arc::clone(&self.session_store),
+                                            session_store: self.session_store.clone(),
                                         },
                                     );
 
